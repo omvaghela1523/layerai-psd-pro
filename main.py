@@ -182,7 +182,7 @@ def create_psd(layer_specs, W, H):
         all_chdata += chd
 
     # Use negative layer count to indicate merged alpha is present
-    li = pk('>h', -len(layer_specs)) + all_records + all_chdata
+    li = pk('>h', len(layer_specs)) + all_records + all_chdata
     if len(li) % 2: li += b'\x00'
 
     body = pk('>I', len(li)) + li + pk('>I', 0)
