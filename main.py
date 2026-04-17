@@ -168,17 +168,7 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
     ch_parts = []
     for ch_id, ch_idx in chs:
         plane = arr[:, :, ch_idx]
-        # RLE: row byte counts + compressed rows
-        row_counts = []
-        row_data = b''
-        for row in plane:
-            raw = row.tobytes()
-            # Simple: just use raw for each row
-            compressed = bytes([len(raw) - 1]) + raw  # literal run
-            row_counts.append(len(compressed))
-            row_data += compressed
         
-        # Actually use raw (compression=0) for simplicity & speed
         ch_data = pk('>H', 0) + plane.tobytes()
         ch_parts.append((ch_id, ch_data))
 
