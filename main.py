@@ -161,7 +161,7 @@ def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
 def create_psd(layer_specs, W, H):
     # Header: 4 channels (RGBA) so merged composite has alpha too
     s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6
-    s1 += pk('>H', 4) + pk('>I', H) + pk('>I', W)
+    s1 += pk('>H', 3) + pk('>I', H) + pk('>I', W)
     s1 += pk('>H', 8) + pk('>H', 3)
 
     s2 = pk('>I', 0)
@@ -196,14 +196,11 @@ def create_psd(layer_specs, W, H):
             merged = Image.alpha_composite(merged, limg)
 
     # 4 channels: A, R, G, B (because header says 4 channels)
-    merged_arr = np.array(merged, dtype=np.uint8)
-    s5 = pk('>H', 0)  # raw compression
-    # Alpha channel first (for 4-channel header)
-    s5 += merged_arr[:, :, 3].tobytes()
-    # Then R, G, B
-    s5 += merged_arr[:, :, 0].tobytes()
-    s5 += merged_arr[:, :, 1].tobytes()
-    s5 += merged_arr[:, :, 2].tobytes()
+    merged_rgb = np.array(merged.convert('RGB'), dtype=np.uint8)
+    s5 = pk('>H', 0)
+    s5 += merged_rgb[:, :, 0].tobytes()
+    s5 += merged_rgb[:, :, 1].tobytes()
+    s5 += merged_rgb[:, :, 2].tobytes()
 
     return s1 + s2 + s3 + s4 + s5
 
