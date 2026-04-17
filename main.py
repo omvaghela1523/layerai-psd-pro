@@ -104,11 +104,14 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
     arr = np.array(img, dtype=np.uint8)
 
     # 4 channels: Alpha(-1), R(0), G(1), B(2)
-    # Each channel: compression=0 (raw) + full plane bytes
     chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
     ch_parts = []
     for ch_id, ch_idx in chs:
-        ch_data = pk('>H', 0) + arr[:, :, ch_idx].tobytes()
+        if ch_id == -1 and name == 'Background':
+            alpha_full = np.full((H, W), 255, dtype=np.uint8)
+            ch_data = pk('>H', 0) + alpha_full.tobytes()
+        else:
+            ch_data = pk('>H', 0) + arr[:, :, ch_idx].tobytes()
         ch_parts.append((ch_id, ch_data))
 
     rec = pk('>IIII', 0, 0, H, W)
