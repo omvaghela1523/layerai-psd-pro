@@ -100,12 +100,12 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
     
     arr = np.array(rgba, dtype=np.uint8)
 
-    if 'Subject' in name or 'Vignette' in name:
-        chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
-        num_ch = 4
-    else:
-        chs = [(0, 0), (1, 1), (2, 2)]
-        num_ch = 3
+    chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
+    num_ch = 4
+    
+    # Background ke liye alpha force 255
+    if 'Subject' not in name and 'Vignette' not in name:
+        arr[:, :, 3] = 255
 
     ch_parts = []
     for ch_id, ch_idx in chs:
