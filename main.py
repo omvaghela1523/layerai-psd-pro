@@ -328,7 +328,11 @@ def generate_psd():
             return jsonify({"error":"No image uploaded"}), 400
 
         raw = request.files['image'].read()
-        orig = Image.open(io.BytesIO(raw)).convert('RGBA')
+        orig = Image.open(io.BytesIO(raw))
+        # Force RGB mode first, then RGBA
+        if orig.mode in ('CMYK', 'P', 'L', 'LA', 'I', 'F'):
+            orig = orig.convert('RGB')
+        orig = orig.convert('RGBA')
         W, H = orig.size
 
         MAX = 1000
@@ -336,6 +340,10 @@ def generate_psd():
             r = min(MAX/W, MAX/H)
             W, H = int(W*r), int(H*r)
             orig = orig.resize((W, H), Image.LANCZOS)
+        
+        # Ensure uint8
+        arr_check = np.array(orig, dtype=np.uint8)
+        orig = Image.fromarray(arr_check, 'RGBA')
 
         specs = []
         lid = 1
