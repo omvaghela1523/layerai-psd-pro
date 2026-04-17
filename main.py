@@ -100,14 +100,20 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
     
     arr = np.array(rgba, dtype=np.uint8)
 
-    chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
+    if 'Subject' in name or 'Vignette' in name:
+        chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
+        num_ch = 4
+    else:
+        chs = [(0, 0), (1, 1), (2, 2)]
+        num_ch = 3
+
     ch_parts = []
     for ch_id, ch_idx in chs:
         ch_data = pk('>H', 0) + arr[:, :, ch_idx].tobytes()
         ch_parts.append((ch_id, ch_data))
 
     rec = pk('>IIII', 0, 0, H, W)
-    rec += pk('>H', 4)
+    rec += pk('>H', num_ch)
     for ch_id, ch_data in ch_parts:
         rec += pk('>hI', ch_id, len(ch_data))
 
