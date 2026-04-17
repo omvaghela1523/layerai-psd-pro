@@ -238,9 +238,12 @@ def generate_psd():
         specs = []
         lid = 1
 
+        bg = orig.copy().convert('RGB')
+        bg_rgba = Image.new('RGBA', (W, H), (255, 255, 255, 255))
+        bg_rgba.paste(bg, (0, 0))
         specs.append({
             'type': 'pixel', 'name': 'Background',
-            'image': orig.copy(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+            'image': bg_rgba, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
         })
         lid += 1
 
