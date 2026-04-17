@@ -19,6 +19,47 @@ def pstring(s, pad=4):
     if r: raw += b'\x00' * (pad - r)
     return raw
 
+def rle_encode_row(row_bytes):
+    """PackBits RLE encode a single row of bytes"""
+    result = bytearray()
+    i = 0
+    n = len(row_bytes)
+    while i < n:
+        # Check for run
+        if i + 1 < n and row_bytes[i] == row_bytes[i+1]:
+            val = row_bytes[i]
+            run = 1
+            while i + run < n and row_bytes[i+run] == val and run < 128:
+                run += 1
+            result.append((256 - (run - 1)) & 0xFF)
+            result.append(val)
+            i += run
+        else:
+            # Literal run
+            lits = bytearray()
+            lits.append(row_bytes[i])
+            i += 1
+            while i < n and len(lits) < 128:
+                if i + 1 < n and row_bytes[i] == row_bytes[i+1]:
+                    break
+                lits.append(row_bytes[i])
+                i += 1
+            result.append(len(lits) - 1)
+            result.extend(lits)
+    return bytes(result)
+
+def rle_encode_channel(plane_2d):
+    """RLE encode a 2D numpy array, return (row_byte_counts, compressed_data)"""
+    H = plane_2d.shape[0]
+    row_counts = []
+    compressed = bytearray()
+    for y in range(H):
+        row = plane_2d[y, :].tobytes()
+        enc = rle_encode_row(row)
+        row_counts.append(len(enc))
+        compressed.extend(enc)
+    return row_counts, bytes(compressed)
+
 def make_additional(key, data):
     block = b'8BIM' + key + pk('>I', len(data)) + data
     if len(block) % 2: block += b'\x00'
@@ -88,32 +129,29 @@ def make_vignette(w, h):
     return img.filter(ImageFilter.GaussianBlur(15))
 
 def build_pixel_layer(name, img, blend, opacity, W, H, lid):
-    # Force fully opaque RGB for all pixel layers
-    rgb = img.convert('RGB').resize((W, H), Image.LANCZOS)
-    rgba = Image.new('RGBA', (W, H), (0, 0, 0, 255))
-    rgba.paste(rgb, (0, 0))
+    # Convert to RGBA, force alpha=255 for non-transparent layers
+    img_rgba = img.convert('RGBA').resize((W, H), Image.LANCZOS)
+    arr = np.array(img_rgba, dtype=np.uint8)
     
-    # For subject masked, keep original alpha
-    if 'Subject' in name or 'Vignette' in name:
-        orig_rgba = img.convert('RGBA').resize((W, H), Image.LANCZOS)
-        rgba = orig_rgba
-    
-    arr = np.array(rgba, dtype=np.uint8)
-
-    chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
-    num_ch = 4
-    
-    # Background ke liye alpha force 255
+    # Force alpha=255 for Background
     if 'Subject' not in name and 'Vignette' not in name:
         arr[:, :, 3] = 255
 
+    # 4 channels with RLE compression (like real Photoshop)
+    chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
     ch_parts = []
     for ch_id, ch_idx in chs:
-        ch_data = pk('>H', 0) + arr[:, :, ch_idx].tobytes()
+        plane = arr[:, :, ch_idx]
+        row_counts, compressed = rle_encode_channel(plane)
+        # Channel data: compression=1 + row byte counts + compressed rows
+        ch_data = pk('>H', 1)
+        for rc in row_counts:
+            ch_data += pk('>H', rc)
+        ch_data += compressed
         ch_parts.append((ch_id, ch_data))
 
     rec = pk('>IIII', 0, 0, H, W)
-    rec += pk('>H', num_ch)
+    rec += pk('>H', 4)
     for ch_id, ch_data in ch_parts:
         rec += pk('>hI', ch_id, len(ch_data))
 
@@ -131,7 +169,7 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
 
 def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
     ch_ids = [-1, 0, 1, 2, -2]
-    ch_data_each = pk('>H', 0)
+    ch_data_each = pk('>H', 0)  # compression=0, no pixels (empty bbox)
 
     rec = pk('>IIII', 0, 0, 0, 0)
     rec += pk('>H', 5)
@@ -153,7 +191,7 @@ def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
     return rec, ch_data_each * 5
 
 def create_psd(layer_specs, W, H, original_rgb):
-    # Header: 3 channels RGB
+    # Header: 3 channels (like real Photoshop)
     s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6
     s1 += pk('>H', 3) + pk('>I', H) + pk('>I', W)
     s1 += pk('>H', 8) + pk('>H', 3)
@@ -180,22 +218,33 @@ def create_psd(layer_specs, W, H, original_rgb):
     body = pk('>I', len(li)) + li + pk('>I', 0)
     s4 = pk('>I', len(body)) + body
 
-    # Merged composite = original image as RGB (this is what Photopea shows)
+    # Merged composite with RLE (like real Photoshop)
     merged_arr = np.array(original_rgb, dtype=np.uint8)
-    s5 = pk('>H', 0)
-    s5 += merged_arr[:, :, 0].tobytes()
-    s5 += merged_arr[:, :, 1].tobytes()
-    s5 += merged_arr[:, :, 2].tobytes()
+    
+    # RLE compress each channel
+    all_row_counts = []
+    all_compressed = []
+    for c in range(3):
+        plane = merged_arr[:, :, c]
+        row_counts, compressed = rle_encode_channel(plane)
+        all_row_counts.extend(row_counts)
+        all_compressed.append(compressed)
+
+    s5 = pk('>H', 1)  # RLE compression
+    for rc in all_row_counts:
+        s5 += pk('>H', rc)
+    for comp in all_compressed:
+        s5 += comp
 
     return s1 + s2 + s3 + s4 + s5
 
 @app.route('/')
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "service": "LayerAI PSD Pro", "version": "12.0.0"})
+    return jsonify({"status": "ok", "service": "LayerAI PSD Pro", "version": "13.0.0"})
 
 @app.route('/generate-psd', methods=['POST'])
-def generate_psd():
+def gen_psd():
     try:
         if 'image' not in request.files:
             return jsonify({"error": "No image uploaded"}), 400
@@ -207,29 +256,25 @@ def generate_psd():
         orig = orig.convert('RGBA')
         W, H = orig.size
 
-        MAX = 1000
+        MAX = 800
         if W > MAX or H > MAX:
             r = min(MAX / W, MAX / H)
             W, H = int(W * r), int(H * r)
             orig = orig.resize((W, H), Image.LANCZOS)
 
-        # Create clean RGB version for merged composite
-        original_rgb = orig.convert('RGB').resize((W, H), Image.LANCZOS)
+        original_rgb = orig.convert('RGB')
 
         specs = []
         lid = 1
 
-        # Background - force opaque
-        bg = orig.convert('RGB')
-        bg_rgba = Image.new('RGBA', (W, H), (0, 0, 0, 255))
-        bg_rgba.paste(bg, (0, 0))
+        # Background
         specs.append({
             'type': 'pixel', 'name': 'Background',
-            'image': bg_rgba, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+            'image': orig.copy(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
         })
         lid += 1
 
-        # Subject Masked
+        # Subject
         if REMOVE_BG_API_KEY:
             try:
                 rsp = requests.post(
@@ -240,7 +285,6 @@ def generate_psd():
                     timeout=20)
                 if rsp.status_code == 200:
                     subj = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
-                    subj = subj.resize((W, H), Image.LANCZOS)
                     specs.append({
                         'type': 'pixel', 'name': 'Subject Masked',
                         'image': subj, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
