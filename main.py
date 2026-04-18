@@ -322,10 +322,14 @@ def gen_psd_dynamic():
         if 'image' not in request.files:
             return jsonify({"error": "No image uploaded"}), 400
 
-        # Get AI analysis values from form data
         brightness = int(request.form.get('brightness', 0))
         contrast = int(request.form.get('contrast', 0))
-        
+        highlights = int(request.form.get('highlights', 0))
+        shadows = int(request.form.get('shadows', 0))
+        color_grade = request.form.get('color_grade', 'Cinematic')
+        effects = request.form.get('effects', '')
+        subject_desc = request.form.get('subject_description', '')
+
         raw = request.files['image'].read()
         orig = Image.open(io.BytesIO(raw))
         if orig.mode in ('CMYK', 'P', 'L', 'LA', 'I', 'F'):
@@ -340,16 +344,17 @@ def gen_psd_dynamic():
             orig = orig.resize((W, H), Image.LANCZOS)
 
         original_rgb = orig.convert('RGB')
-
         specs = []
         lid = 1
 
+        # 1. Background
         specs.append({
             'type': 'pixel', 'name': 'Background',
             'image': orig.copy(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
         })
         lid += 1
 
+        # 2. Subject Masked
         if REMOVE_BG_API_KEY:
             try:
                 rsp = requests.post(
@@ -368,19 +373,38 @@ def gen_psd_dynamic():
             except Exception as e:
                 print('removebg:', e)
 
+        # 3. Curves (dynamic based on highlights/shadows)
         specs.append({'type': 'adjustment', 'name': 'Curves 1',
             'adj_block': make_curv_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
 
+        # 4. Brightness/Contrast (dynamic)
         specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1',
             'adj_block': make_brit_block(brightness, contrast),
             'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
 
-        specs.append({
-            'type': 'pixel', 'name': 'Vignette',
-            'image': make_vignette(W, H), 'blend_mode': 'mul ', 'opacity': 180, 'lid': lid
-        })
+        # 5. Vignette (only if detected in effects)
+        if 'vignette' in effects.lower():
+            specs.append({
+                'type': 'pixel', 'name': 'Vignette',
+                'image': make_vignette(W, H), 'blend_mode': 'mul ', 'opacity': 180, 'lid': lid
+            })
+            lid += 1
+
+        # 6. Color Grade overlay
+        if color_grade:
+            if 'warm' in color_grade.lower():
+                grade_img = Image.new('RGBA', (W, H), (255, 180, 120, 25))
+            elif 'cool' in color_grade.lower():
+                grade_img = Image.new('RGBA', (W, H), (120, 180, 255, 25))
+            else:
+                grade_img = Image.new('RGBA', (W, H), (200, 200, 180, 20))
+            specs.append({
+                'type': 'pixel', 'name': 'Color Grade - ' + color_grade,
+                'image': grade_img, 'blend_mode': 'over', 'opacity': 60, 'lid': lid
+            })
+            lid += 1
 
         psd = create_psd(specs, W, H, original_rgb)
         buf = io.BytesIO(psd)
