@@ -299,15 +299,7 @@ def gen_psd():
         specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1',
             'adj_block': make_brit_block(20, 10), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
-        specs.append({'type': 'adjustment', 'name': 'Hue/Saturation 1',
-            'adj_block': make_hue2_block(0, 15, 5), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
-        lid += 1
-        specs.append({'type': 'adjustment', 'name': 'Color Balance 1',
-            'adj_block': make_blnc_block(-10, 5, 15), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
-        lid += 1
-        specs.append({'type': 'adjustment', 'name': 'Levels 1',
-            'adj_block': make_levl_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
-        lid += 1
+    
         specs.append({
             'type': 'pixel', 'name': 'Vignette',
             'image': make_vignette(W, H), 'blend_mode': 'mul ', 'opacity': 180, 'lid': lid
