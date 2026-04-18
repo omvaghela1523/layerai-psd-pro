@@ -316,6 +316,83 @@ def gen_psd():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+@app.route('/generate-psd-dynamic', methods=['POST'])
+def gen_psd_dynamic():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image uploaded"}), 400
+
+        # Get AI analysis values from form data
+        brightness = int(request.form.get('brightness', 0))
+        contrast = int(request.form.get('contrast', 0))
+        
+        raw = request.files['image'].read()
+        orig = Image.open(io.BytesIO(raw))
+        if orig.mode in ('CMYK', 'P', 'L', 'LA', 'I', 'F'):
+            orig = orig.convert('RGB')
+        orig = orig.convert('RGBA')
+        W, H = orig.size
+
+        MAX = 800
+        if W > MAX or H > MAX:
+            r = min(MAX / W, MAX / H)
+            W, H = int(W * r), int(H * r)
+            orig = orig.resize((W, H), Image.LANCZOS)
+
+        original_rgb = orig.convert('RGB')
+
+        specs = []
+        lid = 1
+
+        specs.append({
+            'type': 'pixel', 'name': 'Background',
+            'image': orig.copy(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        if REMOVE_BG_API_KEY:
+            try:
+                rsp = requests.post(
+                    'https://api.remove.bg/v1.0/removebg',
+                    files={'image_file': ('i.jpg', raw, 'image/jpeg')},
+                    data={'size': 'auto'},
+                    headers={'X-Api-Key': REMOVE_BG_API_KEY},
+                    timeout=20)
+                if rsp.status_code == 200:
+                    subj = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
+                    specs.append({
+                        'type': 'pixel', 'name': 'Subject Masked',
+                        'image': subj, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+                    })
+                    lid += 1
+            except Exception as e:
+                print('removebg:', e)
+
+        specs.append({'type': 'adjustment', 'name': 'Curves 1',
+            'adj_block': make_curv_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
+        lid += 1
+
+        specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1',
+            'adj_block': make_brit_block(brightness, contrast),
+            'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
+        lid += 1
+
+        specs.append({
+            'type': 'pixel', 'name': 'Vignette',
+            'image': make_vignette(W, H), 'blend_mode': 'mul ', 'opacity': 180, 'lid': lid
+        })
+
+        psd = create_psd(specs, W, H, original_rgb)
+        buf = io.BytesIO(psd)
+        buf.seek(0)
+
+        return send_file(buf, mimetype='application/octet-stream',
+                         as_attachment=True, download_name='layerai-export.psd')
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
