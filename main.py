@@ -110,9 +110,9 @@ def make_blnc_block(cr=0, mg=0, yb=0):
     return make_additional(b'blnc', data)
 
 def make_blending_ranges():
-    data = pk('>BBBB', 0, 255, 0, 255) + pk('>BBBB', 0, 255, 0, 255)
-    for _ in range(3):
-        data += pk('>BBBB', 0, 255, 0, 255) + pk('>BBBB', 0, 255, 0, 255)
+    data = b''
+    for _ in range(10):
+        data += pk('>HH', 0, 65535)
     return data
 
 def make_adj_mask_data():
@@ -156,7 +156,7 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
         rec += pk('>hI', ch_id, len(ch_data))
 
     bm = blend.encode('ascii').ljust(4)[:4]
-    rec += b'8BIM' + bm + pk('>BBBB', opacity, 0, 1, 0)
+    rec += b'8BIM' + bm + pk('>BBBB', opacity, 0, 8, 0)
 
     extra = pk('>I', 0)
     br = make_blending_ranges()
