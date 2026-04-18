@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import requests
-import io, os, struct
+import io, os, struct, base64, json
 from PIL import Image, ImageFilter, ImageDraw
 import numpy as np
 
@@ -9,6 +9,42 @@ app = Flask(__name__)
 CORS(app)
 
 REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
+GOOGLE_VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY")
+
+def detect_text(image_bytes, api_key):
+    """Google Vision API se text detect karo"""
+    b64 = base64.b64encode(image_bytes).decode('utf-8')
+    body = {
+        "requests": [{
+            "image": {"content": b64},
+            "features": [{"type": "TEXT_DETECTION", "maxResults": 20}]
+        }]
+    }
+    try:
+        resp = requests.post(
+            f'https://vision.googleapis.com/v1/images:annotate?key={api_key}',
+            json=body, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            annotations = data.get('responses', [{}])[0].get('textAnnotations', [])
+            texts = []
+            for i, ann in enumerate(annotations):
+                if i == 0:
+                    continue
+                verts = ann.get('boundingPoly', {}).get('vertices', [])
+                if len(verts) >= 4:
+                    x = verts[0].get('x', 0)
+                    y = verts[0].get('y', 0)
+                    w = verts[1].get('x', 0) - x
+                    h = verts[2].get('y', 0) - y
+                    texts.append({
+                        'text': ann.get('description', ''),
+                        'x': x, 'y': y, 'w': w, 'h': h
+                    })
+            return texts
+    except Exception as e:
+        print('Vision API error:', e)
+    return []
 
 def pk(fmt, *a): return struct.pack(fmt, *a)
 
@@ -20,12 +56,10 @@ def pstring(s, pad=4):
     return raw
 
 def rle_encode_row(row_bytes):
-    """PackBits RLE encode a single row of bytes"""
     result = bytearray()
     i = 0
     n = len(row_bytes)
     while i < n:
-        # Check for run
         if i + 1 < n and row_bytes[i] == row_bytes[i+1]:
             val = row_bytes[i]
             run = 1
@@ -35,7 +69,6 @@ def rle_encode_row(row_bytes):
             result.append(val)
             i += run
         else:
-            # Literal run
             lits = bytearray()
             lits.append(row_bytes[i])
             i += 1
@@ -49,7 +82,6 @@ def rle_encode_row(row_bytes):
     return bytes(result)
 
 def rle_encode_channel(plane_2d):
-    """RLE encode a 2D numpy array, return (row_byte_counts, compressed_data)"""
     H = plane_2d.shape[0]
     row_counts = []
     compressed = bytearray()
@@ -129,21 +161,17 @@ def make_vignette(w, h):
     return img.filter(ImageFilter.GaussianBlur(15))
 
 def build_pixel_layer(name, img, blend, opacity, W, H, lid):
-    # Convert to RGBA, force alpha=255 for non-transparent layers
     img_rgba = img.convert('RGBA').resize((W, H), Image.LANCZOS)
     arr = np.array(img_rgba, dtype=np.uint8)
     
-    # Force alpha=255 for Background
-    if 'Subject' not in name and 'Vignette' not in name:
+    if 'Subject' not in name and 'Vignette' not in name and 'Text' not in name:
         arr[:, :, 3] = 255
 
-    # 4 channels with RLE compression (like real Photoshop)
     chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
     ch_parts = []
     for ch_id, ch_idx in chs:
         plane = arr[:, :, ch_idx]
         row_counts, compressed = rle_encode_channel(plane)
-        # Channel data: compression=1 + row byte counts + compressed rows
         ch_data = pk('>H', 1)
         for rc in row_counts:
             ch_data += pk('>H', rc)
@@ -169,7 +197,7 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
 
 def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
     ch_ids = [-1, 0, 1, 2, -2]
-    ch_data_each = pk('>H', 0)  # compression=0, no pixels (empty bbox)
+    ch_data_each = pk('>H', 0)
 
     rec = pk('>IIII', 0, 0, 0, 0)
     rec += pk('>H', 5)
@@ -191,7 +219,6 @@ def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
     return rec, ch_data_each * 5
 
 def create_psd(layer_specs, W, H, original_rgb):
-    # Header: 3 channels (like real Photoshop)
     s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6
     s1 += pk('>H', 3) + pk('>I', H) + pk('>I', W)
     s1 += pk('>H', 8) + pk('>H', 3)
@@ -218,10 +245,8 @@ def create_psd(layer_specs, W, H, original_rgb):
     body = pk('>I', len(li)) + li + pk('>I', 0)
     s4 = pk('>I', len(body)) + body
 
-    # Merged composite with RLE (like real Photoshop)
     merged_arr = np.array(original_rgb, dtype=np.uint8)
     
-    # RLE compress each channel
     all_row_counts = []
     all_compressed = []
     for c in range(3):
@@ -230,7 +255,7 @@ def create_psd(layer_specs, W, H, original_rgb):
         all_row_counts.extend(row_counts)
         all_compressed.append(compressed)
 
-    s5 = pk('>H', 1)  # RLE compression
+    s5 = pk('>H', 1)
     for rc in all_row_counts:
         s5 += pk('>H', rc)
     for comp in all_compressed:
@@ -241,7 +266,7 @@ def create_psd(layer_specs, W, H, original_rgb):
 @app.route('/')
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "service": "LayerAI PSD Pro", "version": "13.0.0"})
+    return jsonify({"status": "ok", "service": "LayerAI PSD Pro", "version": "14.0.0"})
 
 @app.route('/generate-psd', methods=['POST'])
 def gen_psd():
@@ -267,14 +292,12 @@ def gen_psd():
         specs = []
         lid = 1
 
-        # Background
         specs.append({
             'type': 'pixel', 'name': 'Background',
             'image': orig.copy(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
         })
         lid += 1
 
-        # Subject
         if REMOVE_BG_API_KEY:
             try:
                 rsp = requests.post(
@@ -316,6 +339,7 @@ def gen_psd():
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 @app.route('/generate-psd-dynamic', methods=['POST'])
 def gen_psd_dynamic():
     try:
@@ -336,6 +360,7 @@ def gen_psd_dynamic():
             orig = orig.convert('RGB')
         orig = orig.convert('RGBA')
         W, H = orig.size
+        orig_W, orig_H = W, H
 
         MAX = 800
         if W > MAX or H > MAX:
@@ -373,7 +398,7 @@ def gen_psd_dynamic():
             except Exception as e:
                 print('removebg:', e)
 
-        # 3. Curves (dynamic based on highlights/shadows)
+        # 3. Curves
         specs.append({'type': 'adjustment', 'name': 'Curves 1',
             'adj_block': make_curv_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
@@ -384,8 +409,8 @@ def gen_psd_dynamic():
             'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
 
-        # 5. Vignette (only if detected in effects)
-        if 'vignette' in effects.lower():
+        # 5. Vignette
+        if 'vignette' in effects.lower() or not effects:
             specs.append({
                 'type': 'pixel', 'name': 'Vignette',
                 'image': make_vignette(W, H), 'blend_mode': 'mul ', 'opacity': 180, 'lid': lid
@@ -405,6 +430,23 @@ def gen_psd_dynamic():
                 'image': grade_img, 'blend_mode': 'over', 'opacity': 60, 'lid': lid
             })
             lid += 1
+
+        # 7. Text layers from Google Vision
+        if GOOGLE_VISION_API_KEY:
+            texts = detect_text(raw, GOOGLE_VISION_API_KEY)
+            for t in texts[:10]:
+                txt_img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+                draw = ImageDraw.Draw(txt_img)
+                scale_x = W / orig_W if orig_W != W else 1
+                scale_y = H / orig_H if orig_H != H else 1
+                tx = int(t['x'] * scale_x)
+                ty = int(t['y'] * scale_y)
+                draw.text((tx, ty), t['text'], fill=(255, 255, 255, 255))
+                specs.append({
+                    'type': 'pixel', 'name': 'Text: ' + t['text'][:20],
+                    'image': txt_img, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+                })
+                lid += 1
 
         psd = create_psd(specs, W, H, original_rgb)
         buf = io.BytesIO(psd)
