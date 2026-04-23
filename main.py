@@ -142,8 +142,11 @@ def make_hue2_block(hue=0, saturation=0, lightness=0, colorize=False):
     """
     Hue/Saturation — LEGACY FORMAT.
     
-    Format: version(2) + colorize(1) + pad(1) + master(6) + 6×ranges(14 each)
-    Total: 94 bytes
+    Format: version(2) + colorize(1) + pad(1) + 7 entries × 14 bytes
+    Each entry: 4 range boundaries (int16) + 3 adjustments (int16)
+    Entry 0 = Master (range values all 0, adjustments = user values)
+    Entry 1-6 = Color ranges (Reds, Yellows, Greens, Cyans, Blues, Magentas)
+    Total: 4 + (7 × 14) = 102 bytes
     
     hue: -180 to 180, saturation: -100 to 100, lightness: -100 to 100
     Default (0,0,0) = no effect on image.
@@ -151,6 +154,9 @@ def make_hue2_block(hue=0, saturation=0, lightness=0, colorize=False):
     data = pk('>H', 2)                            # version = 2
     data += pk('>B', 1 if colorize else 0)         # colorize
     data += b'\x00'                                 # padding
+
+    # Master: 4 range values (unused, all 0) + 3 adjustments
+    data += pk('>hhhh', 0, 0, 0, 0)                # range (unused for master)
     data += pk('>hhh', hue, saturation, lightness)  # master adjustments
 
     # 6 color ranges: Reds, Yellows, Greens, Cyans, Blues, Magentas
