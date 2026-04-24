@@ -20,6 +20,7 @@ CORS(app)
 
 REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
 GOOGLE_VISION_API_KEY = os.environ.get("GOOGLE_VISION_API_KEY")
+RAILWAY_API_URL = os.environ.get("RAILWAY_API_URL", "")
 
 def pk(fmt, *a):
     return struct.pack(fmt, *a)
@@ -162,12 +163,12 @@ def make_hue2_block(hue=0, saturation=0, lightness=0, colorize=False):
     # 6 color ranges: Reds, Yellows, Greens, Cyans, Blues, Magentas
     # Each: 4 range boundaries (int16) + 3 adjustments (int16) = 14 bytes
     default_ranges = [
-        (0,   45,  315, 360),
-        (15,  75,  345, 30),
-        (75,  135, 45,  90),
-        (135, 195, 105, 150),
-        (195, 255, 165, 210),
-        (255, 315, 225, 270),
+        (315, 345, 15,  45),     # Reds
+        (15,  45,  75,  105),    # Yellows
+        (75,  105, 135, 165),    # Greens
+        (135, 165, 195, 225),    # Cyans
+        (195, 225, 255, 285),    # Blues
+        (255, 285, 315, 345),    # Magentas
     ]
     for r1, r2, r3, r4 in default_ranges:
         data += pk('>hhhh', r1, r2, r3, r4)
@@ -218,59 +219,76 @@ def make_blnc_block(shadow_cr=0, shadow_mg=0, shadow_yb=0,
 
 
 # =============================================================================
-# Google Vision text detection
+# Text detection — Uses Claude AI on Railway (replaces Google Vision)
 # =============================================================================
 
-def detect_text(image_bytes, api_key):
-    if not api_key:
-        print('[Vision] No API key')
-        return []
+def detect_text(image_bytes, railway_url):
+    """
+    Detect text in image using Claude AI on Railway server.
+    Falls back to Google Vision if Railway URL not set.
+    """
     if not image_bytes:
-        print('[Vision] No image')
+        print('[TextDetect] No image')
         return []
 
-    b64 = base64.b64encode(image_bytes).decode('utf-8')
-    print(f'[Vision] Sending {len(image_bytes)} bytes...')
+    # Method 1: Claude AI via Railway (PREFERRED)
+    if railway_url:
+        try:
+            print(f'[TextDetect] Using Claude AI at {railway_url}/detect-text')
+            resp = requests.post(
+                f'{railway_url}/detect-text',
+                files={'image': ('image.jpg', image_bytes, 'image/jpeg')},
+                timeout=30
+            )
+            print(f'[TextDetect] Status: {resp.status_code}')
 
-    body = {"requests": [{"image": {"content": b64},
-                           "features": [{"type": "TEXT_DETECTION", "maxResults": 20}]}]}
-    try:
-        resp = requests.post(
-            f'https://vision.googleapis.com/v1/images:annotate?key={api_key}',
-            json=body, timeout=15)
-        print(f'[Vision] Status: {resp.status_code}')
+            if resp.status_code == 200:
+                data = resp.json()
+                texts = data.get('texts', [])
+                print(f'[TextDetect] Claude found {len(texts)} texts')
+                if texts:
+                    print(f'[TextDetect] Full text: {data.get("full_text", "")[:100]}')
+                return texts
+            else:
+                print(f'[TextDetect] Error: {resp.text[:300]}')
+        except Exception as e:
+            print(f'[TextDetect] Claude error: {e}')
+            traceback.print_exc()
 
-        if resp.status_code != 200:
-            print(f'[Vision] Error: {resp.text[:500]}')
-            return []
+    # Method 2: Google Vision API (FALLBACK)
+    api_key = GOOGLE_VISION_API_KEY
+    if api_key:
+        try:
+            print('[TextDetect] Falling back to Google Vision')
+            b64 = base64.b64encode(image_bytes).decode('utf-8')
+            body = {"requests": [{"image": {"content": b64},
+                                   "features": [{"type": "TEXT_DETECTION", "maxResults": 20}]}]}
+            resp = requests.post(
+                f'https://vision.googleapis.com/v1/images:annotate?key={api_key}',
+                json=body, timeout=15)
 
-        data = resp.json()
-        first = data.get('responses', [{}])[0]
-        if 'error' in first:
-            print(f'[Vision] API error: {first["error"]}')
-            return []
+            if resp.status_code == 200:
+                data = resp.json()
+                first = data.get('responses', [{}])[0]
+                annotations = first.get('textAnnotations', [])
+                texts = []
+                for i, ann in enumerate(annotations):
+                    if i == 0:
+                        continue
+                    verts = ann.get('boundingPoly', {}).get('vertices', [])
+                    if len(verts) >= 4:
+                        x = verts[0].get('x', 0)
+                        y = verts[0].get('y', 0)
+                        w = verts[1].get('x', 0) - x
+                        h = verts[2].get('y', 0) - y
+                        texts.append({'text': ann.get('description', ''),
+                                      'x': x, 'y': y, 'w': max(w, 1), 'h': max(h, 1)})
+                print(f'[TextDetect] Vision found {len(texts)} texts')
+                return texts
+        except Exception as e:
+            print(f'[TextDetect] Vision error: {e}')
 
-        annotations = first.get('textAnnotations', [])
-        print(f'[Vision] Found {len(annotations)} annotations')
-
-        texts = []
-        for i, ann in enumerate(annotations):
-            if i == 0:
-                print(f'[Vision] Full: {ann.get("description", "")[:100]}')
-                continue
-            verts = ann.get('boundingPoly', {}).get('vertices', [])
-            if len(verts) >= 4:
-                x = verts[0].get('x', 0)
-                y = verts[0].get('y', 0)
-                w = verts[1].get('x', 0) - x
-                h = verts[2].get('y', 0) - y
-                texts.append({'text': ann.get('description', ''),
-                              'x': x, 'y': y, 'w': max(w, 1), 'h': max(h, 1)})
-        print(f'[Vision] Returning {len(texts)} texts')
-        return texts
-    except Exception as e:
-        print(f'[Vision] Error: {e}')
-        traceback.print_exc()
+    print('[TextDetect] No detection method available')
     return []
 
 
@@ -588,7 +606,7 @@ def gen_psd_dynamic():
             lid += 1
 
         if GOOGLE_VISION_API_KEY:
-            texts = detect_text(raw, GOOGLE_VISION_API_KEY)
+            texts = detect_text(raw, RAILWAY_API_URL)
             for t in texts[:10]:
                 txt_img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
                 draw = ImageDraw.Draw(txt_img)
@@ -614,9 +632,13 @@ def gen_psd_dynamic():
 
 @app.route('/test-vision', methods=['POST'])
 def test_vision():
-    result = {"api_key_set": bool(GOOGLE_VISION_API_KEY)}
-    if not GOOGLE_VISION_API_KEY:
-        result["error"] = "GOOGLE_VISION_API_KEY not set"
+    result = {
+        "railway_url_set": bool(RAILWAY_API_URL),
+        "google_vision_set": bool(GOOGLE_VISION_API_KEY),
+        "method": "claude_ai" if RAILWAY_API_URL else ("google_vision" if GOOGLE_VISION_API_KEY else "none")
+    }
+    if not RAILWAY_API_URL and not GOOGLE_VISION_API_KEY:
+        result["error"] = "Neither RAILWAY_API_URL nor GOOGLE_VISION_API_KEY set"
         return jsonify(result), 500
     if 'image' not in request.files:
         result["error"] = "Send image as multipart form with key 'image'"
@@ -631,7 +653,7 @@ def test_vision():
         result["error"] = "Invalid image"
         return jsonify(result), 400
 
-    texts = detect_text(raw, GOOGLE_VISION_API_KEY)
+    texts = detect_text(raw, RAILWAY_API_URL)
     result["texts"] = texts
     result["count"] = len(texts)
     result["status"] = "ok" if texts else "no_text_found"
