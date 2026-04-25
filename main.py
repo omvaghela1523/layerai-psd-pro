@@ -219,6 +219,190 @@ def make_blnc_block(shadow_cr=0, shadow_mg=0, shadow_yb=0,
 
 
 # =============================================================================
+# EDITABLE TEXT LAYER — TySh (Type Tool) block
+# =============================================================================
+
+def write_tysh_unicode(buf, text):
+    buf.write(pk('>I', len(text)))
+    for ch in text:
+        buf.write(pk('>H', ord(ch)))
+
+def write_tysh_key(buf, key):
+    if len(key) == 4:
+        buf.write(pk('>I', 0))
+        buf.write(key.encode('ascii'))
+    else:
+        enc = key.encode('ascii')
+        buf.write(pk('>I', len(enc)))
+        buf.write(enc)
+
+def build_engine_data(text, font_name='ArialMT', font_size=24.0,
+                       r=1.0, g=1.0, b=1.0):
+    text_escaped = text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+    tlen = len(text) + 1
+    ed = (
+        '<<\n'
+        '\t/EngineDict\n'
+        '\t<<\n'
+        '\t\t/Editor\n'
+        '\t\t<<\n'
+        f'\t\t\t/Text ({text_escaped}\\r)\n'
+        '\t\t>>\n'
+        '\t\t/ParagraphRun\n'
+        '\t\t<<\n'
+        '\t\t\t/DefaultRunData\n'
+        '\t\t\t<<\n'
+        '\t\t\t\t/ParagraphSheet\n'
+        '\t\t\t\t<<\n'
+        '\t\t\t\t\t/DefaultStyleSheet 0\n'
+        '\t\t\t\t\t/Properties\n'
+        '\t\t\t\t\t<<\n'
+        '\t\t\t\t\t>>\n'
+        '\t\t\t\t>>\n'
+        '\t\t\t>>\n'
+        '\t\t\t/RunArray\n'
+        '\t\t\t[\n'
+        '\t\t\t<<\n'
+        '\t\t\t\t/ParagraphSheet\n'
+        '\t\t\t\t<<\n'
+        '\t\t\t\t\t/DefaultStyleSheet 0\n'
+        '\t\t\t\t\t/Properties\n'
+        '\t\t\t\t\t<<\n'
+        '\t\t\t\t\t>>\n'
+        '\t\t\t\t>>\n'
+        f'\t\t\t\t/RunLength {tlen}\n'
+        '\t\t\t>>\n'
+        '\t\t\t]\n'
+        '\t\t>>\n'
+        '\t\t/StyleRun\n'
+        '\t\t<<\n'
+        '\t\t\t/DefaultRunData\n'
+        '\t\t\t<<\n'
+        '\t\t\t\t/StyleSheet\n'
+        '\t\t\t\t<<\n'
+        '\t\t\t\t\t/StyleSheetData\n'
+        '\t\t\t\t\t<<\n'
+        '\t\t\t\t\t>>\n'
+        '\t\t\t\t>>\n'
+        '\t\t\t>>\n'
+        '\t\t\t/RunArray\n'
+        '\t\t\t[\n'
+        '\t\t\t<<\n'
+        '\t\t\t\t/StyleSheet\n'
+        '\t\t\t\t<<\n'
+        '\t\t\t\t\t/StyleSheetData\n'
+        '\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t\t/Font 0\n'
+        f'\t\t\t\t\t\t/FontSize {font_size:.1f}\n'
+        '\t\t\t\t\t\t/FillColor\n'
+        '\t\t\t\t\t\t<<\n'
+        '\t\t\t\t\t\t\t/Type 1\n'
+        f'\t\t\t\t\t\t\t/Values [ 1.0 {r:.4f} {g:.4f} {b:.4f} ]\n'
+        '\t\t\t\t\t\t>>\n'
+        '\t\t\t\t\t>>\n'
+        '\t\t\t\t>>\n'
+        f'\t\t\t\t/RunLength {tlen}\n'
+        '\t\t\t>>\n'
+        '\t\t\t]\n'
+        '\t\t>>\n'
+        '\t>>\n'
+        '\t/ResourceDict\n'
+        '\t<<\n'
+        '\t\t/FontSet\n'
+        '\t\t[\n'
+        '\t\t<<\n'
+        f'\t\t\t/Name ({font_name})\n'
+        '\t\t\t/Script 0\n'
+        '\t\t\t/FontType 1\n'
+        '\t\t\t/Synthetic 0\n'
+        '\t\t>>\n'
+        '\t\t]\n'
+        '\t>>\n'
+        '\t/DocumentResources\n'
+        '\t<<\n'
+        '\t>>\n'
+        '>>'
+    )
+    return b'\xfe\xff' + ed.encode('utf-16-be')
+
+def make_tysh_block(text, x, y, w, h, font_size=24.0,
+                     r=1.0, g=1.0, b=1.0, font_name='ArialMT'):
+    buf = io.BytesIO()
+    buf.write(pk('>H', 1))
+    buf.write(pk('>d', 1.0))
+    buf.write(pk('>d', 0.0))
+    buf.write(pk('>d', 0.0))
+    buf.write(pk('>d', 1.0))
+    buf.write(pk('>d', float(x)))
+    buf.write(pk('>d', float(y)))
+    buf.write(pk('>H', 16))
+
+    desc_buf = io.BytesIO()
+    write_tysh_unicode(desc_buf, 'TxLr')
+    write_tysh_key(desc_buf, 'TxLr')
+    desc_buf.write(pk('>I', 2))
+
+    write_tysh_key(desc_buf, 'Txt ')
+    desc_buf.write(b'TEXT')
+    write_tysh_unicode(desc_buf, text.replace('\n', '\r'))
+
+    write_tysh_key(desc_buf, 'EngineData')
+    desc_buf.write(b'tdta')
+    engine = build_engine_data(text.replace('\n', '\r'), font_name, font_size, r, g, b)
+    desc_buf.write(pk('>I', len(engine)))
+    desc_buf.write(engine)
+
+    buf.write(desc_buf.getvalue())
+
+    buf.write(pk('>H', 16))
+    warp_buf = io.BytesIO()
+    write_tysh_unicode(warp_buf, 'warp')
+    write_tysh_key(warp_buf, 'warp')
+    warp_buf.write(pk('>I', 1))
+    write_tysh_key(warp_buf, 'warpStyle')
+    warp_buf.write(b'enum')
+    write_tysh_key(warp_buf, 'warpStyle')
+    write_tysh_key(warp_buf, 'warpNone')
+    buf.write(warp_buf.getvalue())
+
+    buf.write(pk('>dddd', float(x), float(y), float(x + w), float(y + h)))
+
+    tysh_data = buf.getvalue()
+    block = b'8BIM' + b'TySh' + pk('>I', len(tysh_data)) + tysh_data
+    if len(block) % 2:
+        block += b'\x00'
+    return block
+
+def build_text_layer(name, text, x, y, w, h, font_size, W, H, lid,
+                      r=1.0, g=1.0, b=1.0, font_name='ArialMT', opacity=255):
+    """Build EDITABLE text layer with TySh block."""
+    top = max(0, y)
+    left = max(0, x)
+    bottom = min(H, y + h)
+    right = min(W, x + w)
+
+    ch_ids = [-1, 0, 1, 2]
+    ch_data_each = pk('>H', 0)
+
+    rec = pk('>IIII', top, left, bottom, right)
+    rec += pk('>H', 4)
+    for ch_id in ch_ids:
+        rec += pk('>hI', ch_id, len(ch_data_each))
+
+    rec += b'8BIM' + b'norm' + pk('>BBBB', opacity, 0, 8, 0)
+
+    extra = pk('>I', 0)
+    br = make_blending_ranges()
+    extra += pk('>I', len(br)) + br
+    extra += pstring(name, 4)
+    extra += make_tysh_block(text, x, y, w, h, font_size, r, g, b, font_name)
+    extra += make_common_extras(name, lid, is_adj=False)
+
+    rec += pk('>I', len(extra)) + extra
+    return rec, ch_data_each * 4
+
+
+# =============================================================================
 # Text detection — Uses Claude AI on Railway (replaces Google Vision)
 # =============================================================================
 
@@ -385,6 +569,14 @@ def create_psd(layer_specs, W, H, original_rgb):
         if spec['type'] == 'pixel':
             rec, chd = build_pixel_layer(spec['name'], spec['image'], spec['blend_mode'],
                                           spec['opacity'], W, H, spec['lid'])
+        elif spec['type'] == 'text':
+            rec, chd = build_text_layer(
+                spec['name'], spec['text'],
+                spec['x'], spec['y'], spec['w'], spec['h'],
+                spec.get('font_size', 24.0), W, H, spec['lid'],
+                r=spec.get('r', 1.0), g=spec.get('g', 1.0), b=spec.get('b', 1.0),
+                font_name=spec.get('font_name', 'ArialMT'),
+                opacity=spec.get('opacity', 255))
         else:
             rec, chd = build_adjustment_layer(spec['name'], spec['adj_block'], spec['blend_mode'],
                                                spec['opacity'], W, H, spec['lid'])
@@ -605,18 +797,34 @@ def gen_psd_dynamic():
                           'image': grade_img, 'blend_mode': 'over', 'opacity': 60, 'lid': lid})
             lid += 1
 
-        if GOOGLE_VISION_API_KEY:
-            texts = detect_text(raw, RAILWAY_API_URL)
+        if RAILWAY_API_URL or GOOGLE_VISION_API_KEY:
+            # Resize image for text detection if > 4MB (Claude API 5MB limit)
+            detect_bytes = raw
+            if len(raw) > 4 * 1024 * 1024:
+                detect_img = Image.open(io.BytesIO(raw))
+                detect_img.thumbnail((1024, 1024), Image.LANCZOS)
+                detect_buf = io.BytesIO()
+                detect_img.save(detect_buf, format='JPEG', quality=85)
+                detect_bytes = detect_buf.getvalue()
+                print(f'[TextDetect] Resized {len(raw)} -> {len(detect_bytes)} bytes')
+
+            texts = detect_text(detect_bytes, RAILWAY_API_URL)
             for t in texts[:10]:
-                txt_img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-                draw = ImageDraw.Draw(txt_img)
                 scale_x = W / orig_W if orig_W != W else 1
                 scale_y = H / orig_H if orig_H != H else 1
                 tx = int(t['x'] * scale_x)
                 ty = int(t['y'] * scale_y)
-                draw.text((tx, ty), t['text'], fill=(255, 255, 255, 255))
-                specs.append({'type': 'pixel', 'name': 'Text: ' + t['text'][:20],
-                              'image': txt_img, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
+                tw = max(int(t.get('w', 100) * scale_x), 20)
+                th = max(int(t.get('h', 30) * scale_y), 15)
+                font_size = max(12.0, min(72.0, th * 0.8))
+                specs.append({
+                    'type': 'text',
+                    'name': 'Text: ' + t['text'][:20],
+                    'text': t['text'],
+                    'x': tx, 'y': ty, 'w': tw, 'h': th,
+                    'font_size': font_size,
+                    'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+                })
                 lid += 1
 
         psd = create_psd(specs, W, H, original_rgb)
