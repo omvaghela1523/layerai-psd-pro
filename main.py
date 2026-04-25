@@ -220,158 +220,390 @@ def make_blnc_block(shadow_cr=0, shadow_mg=0, shadow_yb=0,
 
 # =============================================================================
 # EDITABLE TEXT LAYER — TySh (Type Tool) block
+# Template-based approach using exact binary from real Photoshop 2026 PSD
 # =============================================================================
 
-def write_tysh_unicode(buf, text):
-    buf.write(pk('>I', len(text)))
-    for ch in text:
-        buf.write(pk('>H', ord(ch)))
+# Binary sections extracted from a real Photoshop text layer
+# Section B: descriptor header (version 50 + class info + Txt key)
+_TYSH_SEC_B = bytes.fromhex("0032000000100000000100000000000054784c72000000080000000054787420544558540000000c")
+# Section D: textGridding + Ornt + AntA + bounds + boundingBox + TextIndex + EngineData key
+_TYSH_SEC_D = bytes.fromhex("0000000c746578744772696464696e67656e756d0000000c746578744772696464696e67000000004e6f6e65000000004f726e74656e756d000000004f726e740000000048727a6e00000000416e7441656e756d00000000416e6e740000000e616e7469416c696173536861727000000006626f756e64734f626a6300000001000000000006626f756e647300000004000000004c656674556e744623506e74000000000000000000000000546f7020556e744623506e74c0467ff6000000000000000052676874556e744623506e7440697999a00000000000000042746f6d556e744623506e74402e0014000000000000000b626f756e64696e67426f784f626a630000000100000000000b626f756e64696e67426f7800000004000000004c656674556e744623506e743fc400000000000000000000546f7020556e744623506e74c0446c00000000000000000052676874556e744623506e74406977cce00000000000000042746f6d556e744623506e743feb0000000000000000000954657874496e6465786c6f6e67000000010000000a456e67696e65446174617464746100002218")
+# Section F: warp descriptor + final bounds placeholder  
+_TYSH_SEC_F = bytes.fromhex("00010000001000000001000000000004776172700000000500000009776172705374796c65656e756d00000009776172705374796c6500000008776172704e6f6e65000000097761727056616c7565646f756200000000000000000000000f776172705065727370656374697665646f75620000000000000000000000147761727050657273706563746976654f74686572646f756200000000000000000000000a77617270526f74617465656e756d000000004f726e740000000048727a6e00000000000000000000000000000000000000")
 
-def write_tysh_key(buf, key):
-    if len(key) == 4:
-        buf.write(pk('>I', 0))
-        buf.write(key.encode('ascii'))
-    else:
-        enc = key.encode('ascii')
-        buf.write(pk('>I', len(enc)))
-        buf.write(enc)
 
-def build_engine_data(text, font_name='ArialMT', font_size=24.0,
-                       r=1.0, g=1.0, b=1.0):
-    text_escaped = text.replace('\\', '\\\\').replace('(', '\\(').replace(')', '\\)')
+def _utf16be_escape(text_bytes):
+    """Convert bytes to escaped ASCII string for EngineData parens."""
+    result = ''
+    for byte in text_bytes:
+        if 32 <= byte < 127 and byte not in (ord('('), ord(')'), ord('\\')):
+            result += chr(byte)
+        else:
+            result += f'\\x{byte:02x}'
+    return result
+
+
+def _build_engine_data(text, font_name='ArialMT', font_size=24.0,
+                        r=1.0, g=1.0, b=1.0):
+    """
+    Build EngineData in PLAIN ASCII format (matching real Photoshop output).
+    NOT UTF-16BE! That was the critical bug in previous versions.
+    """
+    # Text as UTF-16BE with BOM inside ASCII parens
+    text_u16 = b'\xfe\xff' + text.encode('utf-16-be') + b'\x00\x0d'
+    text_esc = _utf16be_escape(text_u16)
+
+    # Font name as UTF-16BE with BOM
+    font_u16 = b'\xfe\xff' + font_name.encode('utf-16-be')
+    font_esc = _utf16be_escape(font_u16)
+
+    # Fallback font
+    fb_u16 = b'\xfe\xff' + 'MyriadPro-Regular'.encode('utf-16-be')
+    fb_esc = _utf16be_escape(fb_u16)
+
+    # "Normal RGB" label
+    nrgb_u16 = b'\xfe\xff' + 'Normal RGB'.encode('utf-16-be')
+    nrgb_esc = _utf16be_escape(nrgb_u16)
+
+    # Kinsoku name
+    kinsoku_u16 = b'\xfe\xff' + 'PhotoshopKinsokuHard'.encode('utf-16-be')
+    kinsoku_esc = _utf16be_escape(kinsoku_u16)
+
+    # default mojikumi
+    moji_u16 = b'\xfe\xff' + 'default'.encode('utf-16-be')
+    moji_esc = _utf16be_escape(moji_u16)
+
     tlen = len(text) + 1
+
     ed = (
-        '<<\n'
-        '\t/EngineDict\n'
-        '\t<<\n'
-        '\t\t/Editor\n'
-        '\t\t<<\n'
-        f'\t\t\t/Text ({text_escaped}\\r)\n'
-        '\t\t>>\n'
-        '\t\t/ParagraphRun\n'
-        '\t\t<<\n'
-        '\t\t\t/DefaultRunData\n'
-        '\t\t\t<<\n'
-        '\t\t\t\t/ParagraphSheet\n'
-        '\t\t\t\t<<\n'
-        '\t\t\t\t\t/DefaultStyleSheet 0\n'
-        '\t\t\t\t\t/Properties\n'
-        '\t\t\t\t\t<<\n'
-        '\t\t\t\t\t>>\n'
-        '\t\t\t\t>>\n'
-        '\t\t\t>>\n'
-        '\t\t\t/RunArray\n'
-        '\t\t\t[\n'
-        '\t\t\t<<\n'
-        '\t\t\t\t/ParagraphSheet\n'
-        '\t\t\t\t<<\n'
-        '\t\t\t\t\t/DefaultStyleSheet 0\n'
-        '\t\t\t\t\t/Properties\n'
-        '\t\t\t\t\t<<\n'
-        '\t\t\t\t\t>>\n'
-        '\t\t\t\t>>\n'
-        f'\t\t\t\t/RunLength {tlen}\n'
-        '\t\t\t>>\n'
-        '\t\t\t]\n'
-        '\t\t>>\n'
-        '\t\t/StyleRun\n'
-        '\t\t<<\n'
-        '\t\t\t/DefaultRunData\n'
-        '\t\t\t<<\n'
-        '\t\t\t\t/StyleSheet\n'
-        '\t\t\t\t<<\n'
-        '\t\t\t\t\t/StyleSheetData\n'
-        '\t\t\t\t\t<<\n'
-        '\t\t\t\t\t>>\n'
-        '\t\t\t\t>>\n'
-        '\t\t\t>>\n'
-        '\t\t\t/RunArray\n'
-        '\t\t\t[\n'
-        '\t\t\t<<\n'
-        '\t\t\t\t/StyleSheet\n'
-        '\t\t\t\t<<\n'
-        '\t\t\t\t\t/StyleSheetData\n'
-        '\t\t\t\t\t<<\n'
+        f'\n\n<<\n'
+        f'\t/EngineDict\n'
+        f'\t<<\n'
+        f'\t\t/Editor\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Text ({text_esc})\n'
+        f'\t\t>>\n'
+        f'\t\t/ParagraphRun\n'
+        f'\t\t<<\n'
+        f'\t\t\t/DefaultRunData\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/ParagraphSheet\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/DefaultStyleSheet 0\n'
+        f'\t\t\t\t\t/Properties\n'
+        f'\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t>>\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t\t/Adjustments\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/Axis [ 1.0 0.0 1.0 ]\n'
+        f'\t\t\t\t\t/XY [ 0.0 0.0 ]\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t/RunArray [\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/ParagraphSheet\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/DefaultStyleSheet 0\n'
+        f'\t\t\t\t\t/Properties\n'
+        f'\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t\t/Justification 0\n'
+        f'\t\t\t\t\t\t/FirstLineIndent 0.0\n'
+        f'\t\t\t\t\t\t/StartIndent 0.0\n'
+        f'\t\t\t\t\t\t/EndIndent 0.0\n'
+        f'\t\t\t\t\t\t/SpaceBefore 0.0\n'
+        f'\t\t\t\t\t\t/SpaceAfter 0.0\n'
+        f'\t\t\t\t\t\t/AutoHyphenate false\n'
+        f'\t\t\t\t\t\t/HyphenatedWordSize 6\n'
+        f'\t\t\t\t\t\t/PreHyphen 2\n'
+        f'\t\t\t\t\t\t/PostHyphen 2\n'
+        f'\t\t\t\t\t\t/ConsecutiveHyphens 8\n'
+        f'\t\t\t\t\t\t/Zone 36.0\n'
+        f'\t\t\t\t\t\t/WordSpacing [ .8 1.0 1.33 ]\n'
+        f'\t\t\t\t\t\t/LetterSpacing [ 0.0 0.0 0.0 ]\n'
+        f'\t\t\t\t\t\t/GlyphSpacing [ 1.0 1.0 1.0 ]\n'
+        f'\t\t\t\t\t\t/AutoLeading 1.2\n'
+        f'\t\t\t\t\t\t/LeadingType 0\n'
+        f'\t\t\t\t\t\t/Hanging false\n'
+        f'\t\t\t\t\t\t/Burasagari false\n'
+        f'\t\t\t\t\t\t/KinsokuOrder 0\n'
+        f'\t\t\t\t\t\t/EveryLineComposer false\n'
+        f'\t\t\t\t\t>>\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t\t/Adjustments\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/Axis [ 1.0 0.0 1.0 ]\n'
+        f'\t\t\t\t\t/XY [ 0.0 0.0 ]\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t]\n'
+        f'\t\t\t/RunLengthArray [ {tlen} ]\n'
+        f'\t\t\t/IsJoinable 1\n'
+        f'\t\t>>\n'
+        f'\t\t/StyleRun\n'
+        f'\t\t<<\n'
+        f'\t\t\t/DefaultRunData\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/StyleSheet\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/StyleSheetData\n'
+        f'\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t>>\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t/RunArray [\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/StyleSheet\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/StyleSheetData\n'
+        f'\t\t\t\t\t<<\n'
         f'\t\t\t\t\t\t/Font 0\n'
         f'\t\t\t\t\t\t/FontSize {font_size:.1f}\n'
-        '\t\t\t\t\t\t/FillColor\n'
-        '\t\t\t\t\t\t<<\n'
-        '\t\t\t\t\t\t\t/Type 1\n'
+        f'\t\t\t\t\t\t/FauxBold false\n'
+        f'\t\t\t\t\t\t/FauxItalic false\n'
+        f'\t\t\t\t\t\t/AutoLeading true\n'
+        f'\t\t\t\t\t\t/Leading .01\n'
+        f'\t\t\t\t\t\t/HorizontalScale 1.0\n'
+        f'\t\t\t\t\t\t/VerticalScale 1.0\n'
+        f'\t\t\t\t\t\t/Tracking 0\n'
+        f'\t\t\t\t\t\t/AutoKerning true\n'
+        f'\t\t\t\t\t\t/Kerning 0\n'
+        f'\t\t\t\t\t\t/BaselineShift 0.0\n'
+        f'\t\t\t\t\t\t/FontCaps 0\n'
+        f'\t\t\t\t\t\t/FontBaseline 0\n'
+        f'\t\t\t\t\t\t/Underline false\n'
+        f'\t\t\t\t\t\t/Strikethrough false\n'
+        f'\t\t\t\t\t\t/Ligatures true\n'
+        f'\t\t\t\t\t\t/DLigatures false\n'
+        f'\t\t\t\t\t\t/BaselineDirection 1\n'
+        f'\t\t\t\t\t\t/Tsume 0.0\n'
+        f'\t\t\t\t\t\t/StyleRunAlignment 2\n'
+        f'\t\t\t\t\t\t/Language 0\n'
+        f'\t\t\t\t\t\t/NoBreak false\n'
+        f'\t\t\t\t\t\t/FillColor\n'
+        f'\t\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t\t\t/Type 1\n'
         f'\t\t\t\t\t\t\t/Values [ 1.0 {r:.4f} {g:.4f} {b:.4f} ]\n'
-        '\t\t\t\t\t\t>>\n'
-        '\t\t\t\t\t>>\n'
-        '\t\t\t\t>>\n'
-        f'\t\t\t\t/RunLength {tlen}\n'
-        '\t\t\t>>\n'
-        '\t\t\t]\n'
-        '\t\t>>\n'
-        '\t>>\n'
-        '\t/ResourceDict\n'
-        '\t<<\n'
-        '\t\t/FontSet\n'
-        '\t\t[\n'
-        '\t\t<<\n'
-        f'\t\t\t/Name ({font_name})\n'
-        '\t\t\t/Script 0\n'
-        '\t\t\t/FontType 1\n'
-        '\t\t\t/Synthetic 0\n'
-        '\t\t>>\n'
-        '\t\t]\n'
-        '\t>>\n'
-        '\t/DocumentResources\n'
-        '\t<<\n'
-        '\t>>\n'
-        '>>'
+        f'\t\t\t\t\t\t>>\n'
+        f'\t\t\t\t\t\t/StrokeColor\n'
+        f'\t\t\t\t\t\t<<\n'
+        f'\t\t\t\t\t\t\t/Type 1\n'
+        f'\t\t\t\t\t\t\t/Values [ 1.0 0.0 0.0 0.0 ]\n'
+        f'\t\t\t\t\t\t>>\n'
+        f'\t\t\t\t\t\t/YUnderline 1\n'
+        f'\t\t\t\t\t\t/HindiNumbers false\n'
+        f'\t\t\t\t\t\t/Kashida 1\n'
+        f'\t\t\t\t\t>>\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t]\n'
+        f'\t\t\t/RunLengthArray [ {tlen} ]\n'
+        f'\t\t\t/IsJoinable 2\n'
+        f'\t\t>>\n'
+        f'\t\t/GridInfo\n'
+        f'\t\t<<\n'
+        f'\t\t\t/GridIsOn false\n'
+        f'\t\t\t/ShowGrid false\n'
+        f'\t\t\t/GridSize 18.0\n'
+        f'\t\t\t/GridLeading 22.0\n'
+        f'\t\t\t/GridColor\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/Type 1\n'
+        f'\t\t\t\t/Values [ 0.0 0.0 0.0 1.0 ]\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t/GridLeadingFillColor\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/Type 1\n'
+        f'\t\t\t\t/Values [ 0.0 0.0 0.0 1.0 ]\n'
+        f'\t\t\t>>\n'
+        f'\t\t\t/AlignLineHeightToGridFlags false\n'
+        f'\t\t>>\n'
+        f'\t\t/AntiAlias 4\n'
+        f'\t\t/UseFractionalGlyphWidths true\n'
+        f'\t\t/RenderingIntent 0\n'
+        f'\t>>\n'
+        f'\t/ResourceDict\n'
+        f'\t<<\n'
+        f'\t\t/KinsokuSet [\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Name ({kinsoku_esc})\n'
+        f'\t\t\t/NoStart (\\xfe\\xff\\x30\\x01\\x30\\x02\\xff\\x0c\\xff\\x0e)\n'
+        f'\t\t\t/NoEnd (\\xfe\\xff\\x20\\x18\\x20\\x1c\\xff\\x08\\x30\\x14)\n'
+        f'\t\t\t/Keep (\\xfe\\xff\\x20\\x15\\x20\\x25)\n'
+        f'\t\t\t/Hanging (\\xfe\\xff\\x30\\x01\\x30\\x02\\x00.\\x00,)\n'
+        f'\t\t>>\n'
+        f'\t\t]\n'
+        f'\t\t/MojiKumiSet [\n'
+        f'\t\t<<\n'
+        f'\t\t\t/InternalName ({moji_esc})\n'
+        f'\t\t>>\n'
+        f'\t\t]\n'
+        f'\t\t/TheNormalStyleSheet 0\n'
+        f'\t\t/TheNormalParagraphSheet 0\n'
+        f'\t\t/ParagraphSheetSet [\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Name ({nrgb_esc})\n'
+        f'\t\t\t/DefaultStyleSheet 0\n'
+        f'\t\t\t/Properties\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/Justification 0\n'
+        f'\t\t\t\t/FirstLineIndent 0.0\n'
+        f'\t\t\t\t/StartIndent 0.0\n'
+        f'\t\t\t\t/EndIndent 0.0\n'
+        f'\t\t\t\t/SpaceBefore 0.0\n'
+        f'\t\t\t\t/SpaceAfter 0.0\n'
+        f'\t\t\t\t/AutoHyphenate true\n'
+        f'\t\t\t\t/HyphenatedWordSize 6\n'
+        f'\t\t\t\t/PreHyphen 2\n'
+        f'\t\t\t\t/PostHyphen 2\n'
+        f'\t\t\t\t/ConsecutiveHyphens 8\n'
+        f'\t\t\t\t/Zone 36.0\n'
+        f'\t\t\t\t/WordSpacing [ .8 1.0 1.33 ]\n'
+        f'\t\t\t\t/LetterSpacing [ 0.0 0.0 0.0 ]\n'
+        f'\t\t\t\t/GlyphSpacing [ 1.0 1.0 1.0 ]\n'
+        f'\t\t\t\t/AutoLeading 1.2\n'
+        f'\t\t\t\t/LeadingType 0\n'
+        f'\t\t\t\t/Hanging false\n'
+        f'\t\t\t\t/Burasagari false\n'
+        f'\t\t\t\t/KinsokuOrder 0\n'
+        f'\t\t\t\t/EveryLineComposer false\n'
+        f'\t\t\t>>\n'
+        f'\t\t>>\n'
+        f'\t\t]\n'
+        f'\t\t/StyleSheetSet [\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Name ({nrgb_esc})\n'
+        f'\t\t\t/StyleSheetData\n'
+        f'\t\t\t<<\n'
+        f'\t\t\t\t/Font 0\n'
+        f'\t\t\t\t/FontSize 12.0\n'
+        f'\t\t\t\t/FauxBold false\n'
+        f'\t\t\t\t/FauxItalic false\n'
+        f'\t\t\t\t/AutoLeading true\n'
+        f'\t\t\t\t/Leading 0.0\n'
+        f'\t\t\t\t/HorizontalScale 1.0\n'
+        f'\t\t\t\t/VerticalScale 1.0\n'
+        f'\t\t\t\t/Tracking 0\n'
+        f'\t\t\t\t/AutoKerning true\n'
+        f'\t\t\t\t/Kerning 0\n'
+        f'\t\t\t\t/BaselineShift 0.0\n'
+        f'\t\t\t\t/FontCaps 0\n'
+        f'\t\t\t\t/FontBaseline 0\n'
+        f'\t\t\t\t/Underline false\n'
+        f'\t\t\t\t/Strikethrough false\n'
+        f'\t\t\t\t/Ligatures true\n'
+        f'\t\t\t\t/DLigatures false\n'
+        f'\t\t\t\t/BaselineDirection 2\n'
+        f'\t\t\t\t/Tsume 0.0\n'
+        f'\t\t\t\t/StyleRunAlignment 2\n'
+        f'\t\t\t\t/Language 0\n'
+        f'\t\t\t\t/NoBreak false\n'
+        f'\t\t\t\t/FillColor\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/Type 1\n'
+        f'\t\t\t\t\t/Values [ 1.0 0.0 0.0 0.0 ]\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t\t/StrokeColor\n'
+        f'\t\t\t\t<<\n'
+        f'\t\t\t\t\t/Type 1\n'
+        f'\t\t\t\t\t/Values [ 1.0 0.0 0.0 0.0 ]\n'
+        f'\t\t\t\t>>\n'
+        f'\t\t\t\t/FillFlag true\n'
+        f'\t\t\t\t/StrokeFlag false\n'
+        f'\t\t\t\t/FillFirst true\n'
+        f'\t\t\t\t/YUnderline 1\n'
+        f'\t\t\t\t/OutlineWidth 1.0\n'
+        f'\t\t\t\t/CharacterDirection 0\n'
+        f'\t\t\t\t/HindiNumbers false\n'
+        f'\t\t\t\t/Kashida 1\n'
+        f'\t\t\t\t/DiacriticPos 2\n'
+        f'\t\t\t>>\n'
+        f'\t\t>>\n'
+        f'\t\t]\n'
+        f'\t\t/FontSet [\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Name ({font_esc})\n'
+        f'\t\t\t/Script 0\n'
+        f'\t\t\t/FontType 0\n'
+        f'\t\t\t/Synthetic 0\n'
+        f'\t\t>>\n'
+        f'\t\t<<\n'
+        f'\t\t\t/Name ({fb_esc})\n'
+        f'\t\t\t/Script 0\n'
+        f'\t\t\t/FontType 0\n'
+        f'\t\t\t/Synthetic 0\n'
+        f'\t\t>>\n'
+        f'\t\t]\n'
+        f'\t\t/SuperscriptSize .583\n'
+        f'\t\t/SuperscriptPosition .333\n'
+        f'\t\t/SubscriptSize .583\n'
+        f'\t\t/SubscriptPosition .333\n'
+        f'\t\t/SmallCapSize .7\n'
+        f'\t>>\n'
+        f'\t/DocumentResources\n'
+        f'\t<<\n'
+        f'\t\t/KinsokuSet []\n'
+        f'\t\t/MojiKumiSet []\n'
+        f'\t\t/TheNormalStyleSheet 0\n'
+        f'\t\t/TheNormalParagraphSheet 0\n'
+        f'\t\t/ParagraphSheetSet []\n'
+        f'\t\t/StyleSheetSet []\n'
+        f'\t\t/FontSet []\n'
+        f'\t\t/SuperscriptSize .583\n'
+        f'\t\t/SuperscriptPosition .333\n'
+        f'\t\t/SubscriptSize .583\n'
+        f'\t\t/SubscriptPosition .333\n'
+        f'\t\t/SmallCapSize .7\n'
+        f'\t>>\n'
+        f'>>\n'
     )
-    return b'\xfe\xff' + ed.encode('utf-16-be')
+    return ed.encode('ascii')
+
 
 def make_tysh_block(text, x, y, w, h, font_size=24.0,
                      r=1.0, g=1.0, b=1.0, font_name='ArialMT'):
+    """Build TySh block using real Photoshop binary template."""
     buf = io.BytesIO()
+
+    # Version + Transform (50 bytes)
     buf.write(pk('>H', 1))
-    buf.write(pk('>d', 1.0))
-    buf.write(pk('>d', 0.0))
-    buf.write(pk('>d', 0.0))
-    buf.write(pk('>d', 1.0))
-    buf.write(pk('>d', float(x)))
-    buf.write(pk('>d', float(y)))
-    buf.write(pk('>H', 16))
+    buf.write(pk('>d', 1.0))     # xx
+    buf.write(pk('>d', 0.0))     # xy
+    buf.write(pk('>d', 0.0))     # yx
+    buf.write(pk('>d', 1.0))     # yy
+    buf.write(pk('>d', float(x)))  # tx
+    buf.write(pk('>d', float(y)))  # ty
 
-    desc_buf = io.BytesIO()
-    write_tysh_unicode(desc_buf, 'TxLr')
-    write_tysh_key(desc_buf, 'TxLr')
-    desc_buf.write(pk('>I', 2))
+    # Section B: descriptor header with text length updated
+    text_with_null = text + '\x00'
+    sec_b = _TYSH_SEC_B[:-4] + pk('>I', len(text_with_null))
 
-    write_tysh_key(desc_buf, 'Txt ')
-    desc_buf.write(b'TEXT')
-    write_tysh_unicode(desc_buf, text.replace('\n', '\r'))
+    # Section C: text content in UTF-16BE
+    sec_c = text_with_null.encode('utf-16-be')
 
-    write_tysh_key(desc_buf, 'EngineData')
-    desc_buf.write(b'tdta')
-    engine = build_engine_data(text.replace('\n', '\r'), font_name, font_size, r, g, b)
-    desc_buf.write(pk('>I', len(engine)))
-    desc_buf.write(engine)
+    # Build EngineData
+    engine_data = _build_engine_data(text, font_name, font_size, r, g, b)
 
-    buf.write(desc_buf.getvalue())
+    # Section D: update EngineData length (last 4 bytes)
+    sec_d = _TYSH_SEC_D[:-4] + pk('>I', len(engine_data))
 
-    buf.write(pk('>H', 16))
-    warp_buf = io.BytesIO()
-    write_tysh_unicode(warp_buf, 'warp')
-    write_tysh_key(warp_buf, 'warp')
-    warp_buf.write(pk('>I', 1))
-    write_tysh_key(warp_buf, 'warpStyle')
-    warp_buf.write(b'enum')
-    write_tysh_key(warp_buf, 'warpStyle')
-    write_tysh_key(warp_buf, 'warpNone')
-    buf.write(warp_buf.getvalue())
+    # Section F: warp + final bounds
+    warp_part = _TYSH_SEC_F[:-32]
+    bounds = pk('>dddd', float(x), float(y), float(x + w), float(y + h))
+    sec_f = warp_part + bounds
 
-    buf.write(pk('>dddd', float(x), float(y), float(x + w), float(y + h)))
+    buf.write(sec_b)
+    buf.write(sec_c)
+    buf.write(sec_d)
+    buf.write(engine_data)
+    buf.write(sec_f)
 
     tysh_data = buf.getvalue()
     block = b'8BIM' + b'TySh' + pk('>I', len(tysh_data)) + tysh_data
     if len(block) % 2:
         block += b'\x00'
     return block
+
 
 def build_text_layer(name, text, x, y, w, h, font_size, W, H, lid,
                       r=1.0, g=1.0, b=1.0, font_name='ArialMT', opacity=255):
@@ -381,6 +613,7 @@ def build_text_layer(name, text, x, y, w, h, font_size, W, H, lid,
     bottom = min(H, y + h)
     right = min(W, x + w)
 
+    # 4 channels (NOT 5 — text layers don't have user mask channel)
     ch_ids = [-1, 0, 1, 2]
     ch_data_each = pk('>H', 0)
 
@@ -389,9 +622,10 @@ def build_text_layer(name, text, x, y, w, h, font_size, W, H, lid,
     for ch_id in ch_ids:
         rec += pk('>hI', ch_id, len(ch_data_each))
 
+    # flags=8 (not 24 — text layers are not adjustment layers)
     rec += b'8BIM' + b'norm' + pk('>BBBB', opacity, 0, 8, 0)
 
-    extra = pk('>I', 0)
+    extra = pk('>I', 0)  # mask data
     br = make_blending_ranges()
     extra += pk('>I', len(br)) + br
     extra += pstring(name, 4)
