@@ -105,9 +105,14 @@ def make_lclr():
 def make_fxrp():
     return make_additional(b'fxrp', b'\x00' * 16)
 
-def make_common_extras(name, lid, is_adj=False):
+def make_common_extras(name, lid, is_adj=False, is_text=False):
     e = make_luni(name)
-    e += make_lnsr(b'cont' if is_adj else b'layr')
+    if is_adj:
+        e += make_lnsr(b'cont')
+    elif is_text:
+        e += make_lnsr(b'rend')
+    else:
+        e += make_lnsr(b'layr')
     e += make_lyid(lid)
     e += make_clbl() + make_infx() + make_knko() + make_lspf() + make_lclr() + make_fxrp()
     return e
@@ -625,12 +630,12 @@ def build_text_layer(name, text, x, y, w, h, font_size, W, H, lid,
     # flags=8 (not 24 — text layers are not adjustment layers)
     rec += b'8BIM' + b'norm' + pk('>BBBB', opacity, 0, 8, 0)
 
-    extra = pk('>I', 0)  # mask data
+    extra = pk('>I', 0)  # mask data (length=0, same as real PS)
     br = make_blending_ranges()
     extra += pk('>I', len(br)) + br
     extra += pstring(name, 4)
     extra += make_tysh_block(text, x, y, w, h, font_size, r, g, b, font_name)
-    extra += make_common_extras(name, lid, is_adj=False)
+    extra += make_common_extras(name, lid, is_adj=False, is_text=True)
 
     rec += pk('>I', len(extra)) + extra
     return rec, ch_data_each * 4
