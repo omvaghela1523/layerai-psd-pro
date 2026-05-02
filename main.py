@@ -42,41 +42,53 @@ def pstring(s, pad=4):
     return raw
 
 def rle_encode_row(row_bytes):
-    result = bytearray()
+    """RLE encode a single row — optimized with memoryview."""
+    out = bytearray()
+    mv = memoryview(row_bytes)
     i = 0
-    n = len(row_bytes)
+    n = len(mv)
     while i < n:
-        if i + 1 < n and row_bytes[i] == row_bytes[i + 1]:
-            val = row_bytes[i]
-            run = 1
-            while i + run < n and row_bytes[i + run] == val and run < 128:
+        if i + 1 < n and mv[i] == mv[i + 1]:
+            val = mv[i]
+            run = 2
+            limit = min(n, i + 128)
+            while i + run < limit and mv[i + run] == val:
                 run += 1
-            result.append((256 - (run - 1)) & 0xFF)
-            result.append(val)
+            out.append((257 - run) & 0xFF)
+            out.append(val)
             i += run
         else:
-            lits = bytearray()
-            lits.append(row_bytes[i])
-            i += 1
-            while i < n and len(lits) < 128:
-                if i + 1 < n and row_bytes[i] == row_bytes[i + 1]:
+            j = i + 1
+            limit = min(n, i + 128)
+            while j < limit:
+                if j + 1 < n and mv[j] == mv[j + 1]:
                     break
-                lits.append(row_bytes[i])
-                i += 1
-            result.append(len(lits) - 1)
-            result.extend(lits)
-    return bytes(result)
+                j += 1
+            count = j - i
+            out.append(count - 1)
+            out.extend(mv[i:j])
+            i = j
+    return bytes(out)
 
 def rle_encode_channel(plane_2d):
-    H = plane_2d.shape[0]
+    """RLE encode entire channel plane — returns (row_counts, compressed_bytes)."""
+    H, W = plane_2d.shape
+    row_data = []
     row_counts = []
-    compressed = bytearray()
     for y in range(H):
-        row = plane_2d[y, :].tobytes()
-        enc = rle_encode_row(row)
+        enc = rle_encode_row(plane_2d[y].tobytes())
         row_counts.append(len(enc))
-        compressed.extend(enc)
-    return row_counts, bytes(compressed)
+        row_data.append(enc)
+    return row_counts, b''.join(row_data)
+
+def rle_pack_channel(plane_2d):
+    """Pack channel with RLE: compression(2) + row_counts(H*2) + data. Returns bytes."""
+    H = plane_2d.shape[0]
+    row_counts, compressed = rle_encode_channel(plane_2d)
+    parts = [pk('>H', 1)]  # compression = RLE
+    parts.extend(pk('>H', rc) for rc in row_counts)
+    parts.append(compressed)
+    return b''.join(parts)
 
 # === Additional layer data blocks ===
 
@@ -842,32 +854,32 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
     if 'Subject' not in name and 'Vignette' not in name and 'Text' not in name:
         arr[:, :, 3] = 255
 
-    chs = [(-1, 3), (0, 0), (1, 1), (2, 2)]
-    ch_parts = []
-    for ch_id, ch_idx in chs:
-        plane = arr[:, :, ch_idx]
-        row_counts, compressed = rle_encode_channel(plane)
-        ch_data = pk('>H', 1)
-        for rc in row_counts:
-            ch_data += pk('>H', rc)
-        ch_data += compressed
-        ch_parts.append((ch_id, ch_data))
+    # Channel order: alpha(-1), R(0), G(1), B(2)
+    ch_map = [(-1, 3), (0, 0), (1, 1), (2, 2)]
+    ch_packed = []
+    for ch_id, ch_idx in ch_map:
+        packed = rle_pack_channel(arr[:, :, ch_idx])
+        ch_packed.append((ch_id, packed))
 
-    rec = pk('>IIII', 0, 0, H, W)
-    rec += pk('>H', 4)
-    for ch_id, ch_data in ch_parts:
-        rec += pk('>hI', ch_id, len(ch_data))
+    # Build record
+    parts = [pk('>IIII', 0, 0, H, W), pk('>H', 4)]
+    for ch_id, packed in ch_packed:
+        parts.append(pk('>hI', ch_id, len(packed)))
 
     bm = blend.encode('ascii').ljust(4)[:4]
-    rec += b'8BIM' + bm + pk('>BBBB', opacity, 0, 8, 0)
+    parts.append(b'8BIM' + bm + pk('>BBBB', opacity, 0, 8, 0))
 
-    extra = pk('>I', 0)
+    # Extra data
     br = make_blending_ranges()
-    extra += pk('>I', len(br)) + br
-    extra += pstring(name, 4)
-    extra += make_common_extras(name, lid, is_adj=False)
-    rec += pk('>I', len(extra)) + extra
-    return rec, b''.join(cd for _, cd in ch_parts)
+    extra_parts = [pk('>I', 0), pk('>I', len(br)), br, pstring(name, 4)]
+    extra_parts.append(make_common_extras(name, lid, is_adj=False))
+    extra = b''.join(extra_parts)
+    parts.append(pk('>I', len(extra)))
+    parts.append(extra)
+
+    rec = b''.join(parts)
+    ch_data = b''.join(p for _, p in ch_packed)
+    return rec, ch_data
 
 def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
     ch_ids = [-1, 0, 1, 2, -2]
@@ -898,10 +910,11 @@ def build_adjustment_layer(name, adj_block, blend, opacity, W, H, lid):
 # =============================================================================
 
 def create_psd(layer_specs, W, H, original_rgb, ppi=300):
+    import time
+    t0 = time.time()
+
     # Section 1: File Header
-    s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6
-    s1 += pk('>H', 3) + pk('>I', H) + pk('>I', W)
-    s1 += pk('>H', 8) + pk('>H', 3)
+    s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6 + pk('>H', 3) + pk('>I', H) + pk('>I', W) + pk('>H', 8) + pk('>H', 3)
 
     # Section 2: Color Mode Data
     s2 = pk('>I', 0)
@@ -911,8 +924,8 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
     s3 = pk('>I', len(img_resources)) + img_resources
 
     # Section 4: Layer and Mask Information
-    all_records = b''
-    all_chdata = b''
+    rec_parts = []
+    chd_parts = []
     for spec in layer_specs:
         if spec['type'] == 'pixel':
             rec, chd = build_pixel_layer(spec['name'], spec['image'], spec['blend_mode'],
@@ -929,12 +942,15 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
         else:
             rec, chd = build_adjustment_layer(spec['name'], spec['adj_block'], spec['blend_mode'],
                                                spec['opacity'], W, H, spec['lid'])
-        all_records += rec
-        all_chdata += chd
+        rec_parts.append(rec)
+        chd_parts.append(chd)
 
-    # Layer count negative = alpha channel present (matching reference: raw=-7)
+    t1 = time.time()
+    print(f'[PSD] Layers built in {t1-t0:.2f}s')
+
+    # Assemble layer info
     layer_count = len(layer_specs)
-    li = pk('>h', -layer_count) + all_records + all_chdata
+    li = pk('>h', -layer_count) + b''.join(rec_parts) + b''.join(chd_parts)
     if len(li) % 2:
         li += b'\x00'
     body = pk('>I', len(li)) + li + pk('>I', 0)
@@ -945,16 +961,17 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
     all_row_counts = []
     all_compressed = []
     for c in range(3):
-        plane = merged_arr[:, :, c]
-        row_counts, compressed = rle_encode_channel(plane)
+        row_counts, compressed = rle_encode_channel(merged_arr[:, :, c])
         all_row_counts.extend(row_counts)
         all_compressed.append(compressed)
 
-    s5 = pk('>H', 1)
-    for rc in all_row_counts:
-        s5 += pk('>H', rc)
-    for comp in all_compressed:
-        s5 += comp
+    s5_parts = [pk('>H', 1)]
+    s5_parts.extend(pk('>H', rc) for rc in all_row_counts)
+    s5_parts.extend(all_compressed)
+    s5 = b''.join(s5_parts)
+
+    t2 = time.time()
+    print(f'[PSD] Composite in {t2-t1:.2f}s, total {t2-t0:.2f}s')
 
     return s1 + s2 + s3 + s4 + s5
 
