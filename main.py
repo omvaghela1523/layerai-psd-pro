@@ -913,8 +913,8 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
     import time
     t0 = time.time()
 
-    # Section 1: File Header
-    s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6 + pk('>H', 3) + pk('>I', H) + pk('>I', W) + pk('>H', 8) + pk('>H', 3)
+    # Section 1: File Header — 4 channels (RGBA) because negative layer count = alpha present
+    s1 = b'8BPS' + pk('>H', 1) + b'\x00' * 6 + pk('>H', 4) + pk('>I', H) + pk('>I', W) + pk('>H', 8) + pk('>H', 3)
 
     # Section 2: Color Mode Data
     s2 = pk('>I', 0)
@@ -957,13 +957,24 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
     s4 = pk('>I', len(body)) + body
 
     # Section 5: Image Data (merged composite)
+    # Merged composite needs 4 channels (RGBA) to match header
     merged_arr = np.array(original_rgb, dtype=np.uint8)
+    # Create alpha channel (fully opaque)
+    alpha_plane = np.full((H, W), 255, dtype=np.uint8)
+
     all_row_counts = []
     all_compressed = []
+    # Alpha first (channel -1 in header order maps to first channel in composite)
+    # Actually PSD merged composite order = channels in header order
+    # For RGBA: R, G, B, Alpha
     for c in range(3):
         row_counts, compressed = rle_encode_channel(merged_arr[:, :, c])
         all_row_counts.extend(row_counts)
         all_compressed.append(compressed)
+    # Alpha channel
+    row_counts, compressed = rle_encode_channel(alpha_plane)
+    all_row_counts.extend(row_counts)
+    all_compressed.append(compressed)
 
     s5_parts = [pk('>H', 1)]
     s5_parts.extend(pk('>H', rc) for rc in all_row_counts)
