@@ -1034,11 +1034,32 @@ def build_group_marker_layer(name, lid, is_open=True, W=100, H=100):
 # Layer builders
 # =============================================================================
 
-def build_pixel_layer(name, img, blend, opacity, W, H, lid):
-    img_rgba = img.convert('RGBA').resize((W, H), Image.LANCZOS)
-    arr = np.array(img_rgba, dtype=np.uint8)
-    if 'Subject' not in name and 'Vignette' not in name and 'Text' not in name:
-        arr[:, :, 3] = 255
+def build_pixel_layer(name, img, blend, opacity, W, H, lid,
+                      custom_top=None, custom_left=None):
+    """Build a pixel layer. Subject/Shadow keep their own size; others resize to canvas."""
+    is_overlay = ('Subject' in name or 'Shadow' in name or 'Vignette' in name)
+
+    if is_overlay:
+        # Keep original size, don't force to canvas
+        img_rgba = img.convert('RGBA')
+        lw, lh = img_rgba.size
+        arr = np.array(img_rgba, dtype=np.uint8)
+        # Calculate bounds — center on canvas if no custom position
+        if custom_left is not None and custom_top is not None:
+            layer_left = custom_left
+            layer_top = custom_top
+        else:
+            layer_left = 0
+            layer_top = 0
+        layer_right = layer_left + lw
+        layer_bottom = layer_top + lh
+    else:
+        # Background and others: resize to canvas
+        img_rgba = img.convert('RGBA').resize((W, H), Image.LANCZOS)
+        arr = np.array(img_rgba, dtype=np.uint8)
+        arr[:, :, 3] = 255  # Force opaque
+        lw, lh = W, H
+        layer_top, layer_left, layer_bottom, layer_right = 0, 0, H, W
 
     # Channel order: alpha(-1), R(0), G(1), B(2)
     ch_map = [(-1, 3), (0, 0), (1, 1), (2, 2)]
@@ -1047,8 +1068,8 @@ def build_pixel_layer(name, img, blend, opacity, W, H, lid):
         packed = rle_pack_channel(arr[:, :, ch_idx])
         ch_packed.append((ch_id, packed))
 
-    # Build record
-    parts = [pk('>IIII', 0, 0, H, W), pk('>H', 4)]
+    # Build record — use signed int32 for bounds (can be negative for Smart Objects)
+    parts = [pk('>iiii', layer_top, layer_left, layer_bottom, layer_right), pk('>H', 4)]
     for ch_id, packed in ch_packed:
         parts.append(pk('>hI', ch_id, len(packed)))
 
@@ -1254,9 +1275,7 @@ def gen_psd():
                       'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
 
-        specs.append({'type': 'adjustment', 'name': 'Gradient Map 1',
-                      'adj_block': make_grdm_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
-        lid += 1
+        # Gradient Map removed — was causing orange tint over entire image
 
         psd = create_psd(specs, W, H, original_rgb, ppi=300)
         buf = io.BytesIO(psd)
@@ -1378,9 +1397,7 @@ def gen_psd_dynamic():
                       'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
         lid += 1
 
-        specs.append({'type': 'adjustment', 'name': 'Gradient Map 1',
-                      'adj_block': make_grdm_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid})
-        lid += 1
+        # Gradient Map removed — was causing orange tint over entire image
 
         # Optional: Hue/Saturation, Color Balance (if values non-zero)
         if hue != 0 or saturation != 0 or lightness != 0:
@@ -1608,12 +1625,7 @@ def gen_psd_pro():
             })
             lid += 1
 
-        specs.append({
-            'type': 'adjustment', 'name': 'Gradient Map 1',
-            'adj_block': make_grdm_block(),
-            'blend_mode': 'norm', 'opacity': 255, 'lid': lid
-        })
-        lid += 1
+        # Gradient Map removed — was causing orange tint over entire image
 
         if use_groups:
             # Open marker (top of group)
@@ -1653,7 +1665,6 @@ def test_adjustments():
     specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1', 'adj_block': make_brit_block(15, 10), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
     specs.append({'type': 'adjustment', 'name': 'Levels 1', 'adj_block': make_levl_block(shadows=10, midtones=120, highlights=245), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
     specs.append({'type': 'adjustment', 'name': 'Curves 1', 'adj_block': make_curv_block([(0, 0), (87, 93), (255, 255)]), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
-    specs.append({'type': 'adjustment', 'name': 'Gradient Map 1', 'adj_block': make_grdm_block(), 'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
 
     psd = create_psd(specs, W, H, bg.convert('RGB'), ppi=300)
     buf = io.BytesIO(psd); buf.seek(0)
