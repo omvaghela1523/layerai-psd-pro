@@ -837,6 +837,200 @@ def make_vignette(w, h):
 
 
 # =============================================================================
+# Stability AI Inpainting — generates clean background by filling subject area
+# =============================================================================
+
+STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY")
+
+def inpaint_background(original_bytes, subject_mask_alpha, prompt="natural background, clean, photorealistic"):
+    """
+    Use Stability AI to fill the subject area with realistic background.
+
+    Args:
+        original_bytes: Original image bytes (JPEG/PNG)
+        subject_mask_alpha: PIL Image (L mode) — white=subject, black=background
+                            We need to invert it: white=area to fill (subject area)
+        prompt: What to generate in the masked area
+
+    Returns:
+        PIL Image (RGB) of clean background, or None if API fails
+    """
+    if not STABILITY_API_KEY:
+        print('[Inpaint] STABILITY_API_KEY not set, skipping')
+        return None
+
+    try:
+        # Prepare images
+        original_img = Image.open(io.BytesIO(original_bytes)).convert('RGB')
+        W, H = original_img.size
+
+        # Stability AI requires images <= 1 megapixel for v2beta inpaint
+        # Resize if needed
+        scale = 1.0
+        if W * H > 1024 * 1024:
+            scale = (1024 * 1024 / (W * H)) ** 0.5
+            new_W, new_H = int(W * scale), int(H * scale)
+            original_img = original_img.resize((new_W, new_H), Image.LANCZOS)
+            subject_mask_alpha = subject_mask_alpha.resize((new_W, new_H), Image.LANCZOS)
+
+        # Save resized image to bytes
+        img_buf = io.BytesIO()
+        original_img.save(img_buf, format='PNG')
+        img_buf.seek(0)
+
+        # Mask: dilate slightly so edges blend better
+        mask_arr = np.array(subject_mask_alpha)
+        # Dilate the mask by a few pixels
+        from PIL import ImageFilter as IF
+        mask_dilated = subject_mask_alpha.filter(IF.MaxFilter(15))
+        mask_buf = io.BytesIO()
+        mask_dilated.convert('L').save(mask_buf, format='PNG')
+        mask_buf.seek(0)
+
+        # Call Stability AI v2beta inpaint endpoint
+        resp = requests.post(
+            "https://api.stability.ai/v2beta/stable-image/edit/inpaint",
+            headers={
+                "authorization": f"Bearer {STABILITY_API_KEY}",
+                "accept": "image/*",
+            },
+            files={
+                "image": ("image.png", img_buf, "image/png"),
+                "mask": ("mask.png", mask_buf, "image/png"),
+            },
+            data={
+                "prompt": prompt,
+                "output_format": "png",
+                "mode": "mask",
+            },
+            timeout=60
+        )
+
+        if resp.status_code != 200:
+            print(f'[Inpaint] API error {resp.status_code}: {resp.text[:200]}')
+            return None
+
+        result = Image.open(io.BytesIO(resp.content)).convert('RGB')
+
+        # Resize back to original size if we scaled down
+        if scale != 1.0:
+            result = result.resize((W, H), Image.LANCZOS)
+
+        print(f'[Inpaint] Success: {result.size}')
+        return result
+
+    except Exception as e:
+        print(f'[Inpaint] Error: {e}')
+        return None
+
+
+# =============================================================================
+# Soft shadow generator — creates a blurred shadow from subject's alpha channel
+# =============================================================================
+
+def make_soft_shadow(subject_rgba, offset_x=10, offset_y=30, blur_radius=25, opacity=140):
+    """
+    Generate a soft shadow layer from subject's alpha channel.
+
+    Args:
+        subject_rgba: PIL Image (RGBA) of the subject (alpha contains subject silhouette)
+        offset_x, offset_y: Shadow displacement in pixels
+        blur_radius: Gaussian blur amount
+        opacity: Shadow darkness (0-255)
+
+    Returns:
+        PIL Image (RGBA) — black silhouette, blurred, offset
+    """
+    W, H = subject_rgba.size
+
+    # Extract alpha (silhouette of subject)
+    alpha = subject_rgba.split()[-1]
+
+    # Create black image with subject's alpha as transparency
+    shadow = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    black_layer = Image.new('RGBA', (W, H), (0, 0, 0, opacity))
+    shadow.paste(black_layer, (0, 0), alpha)
+
+    # Blur the shadow
+    shadow = shadow.filter(ImageFilter.GaussianBlur(blur_radius))
+
+    # Offset the shadow
+    if offset_x != 0 or offset_y != 0:
+        offset_shadow = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+        offset_shadow.paste(shadow, (offset_x, offset_y))
+        shadow = offset_shadow
+
+    return shadow
+
+
+# =============================================================================
+# Layer Groups — using lsct (Layer Section divider) block
+# =============================================================================
+
+def make_lsct_open(group_name=None):
+    """
+    Layer section divider block - marks start of an open group folder.
+    Type 1 = open folder.
+    """
+    data = pk('>I', 1)  # Type: open folder
+    return make_additional(b'lsct', data)
+
+
+def make_lsct_close():
+    """
+    Layer section divider block - marks end of a group (bounding divider).
+    Type 3 = bounding section divider.
+    """
+    data = pk('>I', 3)  # Type: bounding section divider
+    return make_additional(b'lsct', data)
+
+
+def build_group_marker_layer(name, lid, is_open=True, W=100, H=100):
+    """
+    Build a 'group marker' layer that Photoshop interprets as a group folder.
+    For an open group: place a 'open folder' marker BEFORE the group's children
+    For a close group: place a 'bounding divider' marker AFTER the children
+
+    Photoshop reads layers bottom-to-top, so:
+    - Insert close-marker FIRST (bottom)
+    - Then group's child layers
+    - Then open-marker LAST (top)
+    """
+    # Empty channel data (group markers have no pixel data)
+    ch_data_each = pk('>H', 0)
+    ch_ids = [-1, 0, 1, 2]
+
+    rec_parts = [pk('>IIII', 0, 0, 0, 0), pk('>H', 4)]
+    for ch_id in ch_ids:
+        rec_parts.append(pk('>hI', ch_id, len(ch_data_each)))
+
+    # Group markers use 'pass' blend mode (passthrough)
+    blend_mode = b'pass' if is_open else b'norm'
+    rec_parts.append(b'8BIM' + blend_mode + pk('>BBBB', 255, 0, 0x18, 0))
+
+    # Extra data
+    extra_parts = [pk('>I', 0)]  # mask data
+    br = make_blending_ranges()
+    extra_parts.append(pk('>I', len(br)))
+    extra_parts.append(br)
+    extra_parts.append(pstring(name if is_open else '</Layer group>', 4))
+
+    # The lsct block IS the group marker
+    if is_open:
+        extra_parts.append(make_lsct_open(name))
+    else:
+        extra_parts.append(make_lsct_close())
+
+    extra_parts.append(make_common_extras(name if is_open else '</Layer group>', lid, is_adj=False))
+    extra = b''.join(extra_parts)
+
+    rec_parts.append(pk('>I', len(extra)))
+    rec_parts.append(extra)
+
+    return b''.join(rec_parts), ch_data_each * 4
+
+
+# =============================================================================
 # Layer builders
 # =============================================================================
 
@@ -931,6 +1125,10 @@ def create_psd(layer_specs, W, H, original_rgb, ppi=300):
                 font_name=spec.get('font_name', 'ArialMT'),
                 opacity=spec.get('opacity', 255),
                 add_effects=spec.get('add_effects', True))
+        elif spec['type'] == 'group_open':
+            rec, chd = build_group_marker_layer(spec['name'], spec['lid'], is_open=True)
+        elif spec['type'] == 'group_close':
+            rec, chd = build_group_marker_layer(spec.get('name', ''), spec['lid'], is_open=False)
         else:
             rec, chd = build_adjustment_layer(spec['name'], spec['adj_block'], spec['blend_mode'],
                                                spec['opacity'], W, H, spec['lid'])
@@ -1213,6 +1411,229 @@ def gen_psd_dynamic():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+# =============================================================================
+# /generate-psd-pro — FULL 7-STEP PIPELINE
+# =============================================================================
+# 1. Extract subject from image using mask (Remove.bg)
+# 2. Remove subject area & generate clean background (Stability AI inpainting)
+# 3. Place background as bottom layer
+# 4. Place subject as separate masked layer above
+# 5. Add soft shadow under subject
+# 6. Apply global color adjustments (hue/sat, cinematic tone)
+# 7. Maintain clean layer naming and grouping
+# =============================================================================
+
+@app.route('/generate-psd-pro', methods=['POST'])
+def gen_psd_pro():
+    """Full pipeline: subject extraction + inpainted background + shadow + grouped adjustments."""
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image uploaded"}), 400
+
+        # Editing parameters (from Claude analysis or defaults)
+        brightness = int(request.form.get('brightness', 0))
+        contrast = int(request.form.get('contrast', 0))
+        hue = int(request.form.get('hue', 0))
+        saturation = int(request.form.get('saturation', 0))
+        lightness = int(request.form.get('lightness', 0))
+
+        lvl_shadows = int(request.form.get('lvl_shadows', 0))
+        lvl_midtones = int(request.form.get('lvl_midtones', 100))
+        lvl_highlights = int(request.form.get('lvl_highlights', 255))
+
+        cb_midtone_cr = int(request.form.get('cb_midtone_cr', 0))
+        cb_midtone_mg = int(request.form.get('cb_midtone_mg', 0))
+        cb_midtone_yb = int(request.form.get('cb_midtone_yb', 0))
+
+        # Shadow parameters
+        shadow_offset_x = int(request.form.get('shadow_offset_x', 10))
+        shadow_offset_y = int(request.form.get('shadow_offset_y', 30))
+        shadow_blur = int(request.form.get('shadow_blur', 25))
+        shadow_opacity = int(request.form.get('shadow_opacity', 140))
+        add_shadow = request.form.get('add_shadow', 'true').lower() == 'true'
+
+        # Inpaint prompt
+        inpaint_prompt = request.form.get('inpaint_prompt',
+                                          'natural background, photorealistic, clean, no people')
+
+        # Layer grouping
+        use_groups = request.form.get('use_groups', 'true').lower() == 'true'
+
+        # Read original image
+        raw = request.files['image'].read()
+        orig = Image.open(io.BytesIO(raw))
+        if orig.mode in ('CMYK', 'P', 'L', 'LA', 'I', 'F'):
+            orig = orig.convert('RGB')
+        orig_rgba = orig.convert('RGBA')
+        W, H = orig_rgba.size
+
+        print(f'[Pipeline] Starting for {W}x{H} image')
+
+        # =========================================================
+        # STEP 1: Extract subject using Remove.bg
+        # =========================================================
+        subject_rgba = None
+        subject_mask = None
+        if REMOVE_BG_API_KEY:
+            try:
+                rsp = requests.post(
+                    'https://api.remove.bg/v1.0/removebg',
+                    files={'image_file': ('i.jpg', raw, 'image/jpeg')},
+                    data={'size': 'auto'},
+                    headers={'X-Api-Key': REMOVE_BG_API_KEY},
+                    timeout=30
+                )
+                if rsp.status_code == 200:
+                    subject_rgba = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
+                    # Resize to match original
+                    if subject_rgba.size != (W, H):
+                        subject_rgba = subject_rgba.resize((W, H), Image.LANCZOS)
+                    # Extract alpha as mask (white=subject, black=bg)
+                    subject_mask = subject_rgba.split()[-1]
+                    print(f'[Step 1] Subject extracted ✓')
+                else:
+                    print(f'[Step 1] Remove.bg failed: {rsp.status_code}')
+            except Exception as e:
+                print(f'[Step 1] Remove.bg error: {e}')
+
+        # =========================================================
+        # STEP 2: Inpaint clean background using Stability AI
+        # =========================================================
+        clean_background = None
+        if subject_mask and STABILITY_API_KEY:
+            print(f'[Step 2] Inpainting background...')
+            clean_background = inpaint_background(raw, subject_mask, inpaint_prompt)
+            if clean_background:
+                print(f'[Step 2] Background inpainted ✓')
+            else:
+                print(f'[Step 2] Inpainting failed, using original as fallback')
+
+        # Fallback: if inpainting failed, use original image as background
+        if clean_background is None:
+            clean_background = orig.convert('RGB')
+
+        # =========================================================
+        # STEP 3-7: Build PSD with grouped layers
+        # =========================================================
+        specs = []
+        lid = 1
+
+        # ===== LAYER STACK (bottom to top) =====
+        # Order in PSD file = bottom to top:
+        # 1. Background (clean inpainted)
+        # 2. Shadow (between bg and subject)
+        # 3. Subject (masked)
+        # 4. [Adjustments group] (color corrections)
+
+        # STEP 3: Background as bottom layer
+        bg_rgba = clean_background.convert('RGBA')
+        specs.append({
+            'type': 'pixel', 'name': 'Background (Clean)',
+            'image': bg_rgba, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        # STEP 5: Soft shadow under subject (only if we have subject + add_shadow)
+        if subject_rgba and add_shadow:
+            shadow_img = make_soft_shadow(
+                subject_rgba,
+                offset_x=shadow_offset_x,
+                offset_y=shadow_offset_y,
+                blur_radius=shadow_blur,
+                opacity=shadow_opacity
+            )
+            specs.append({
+                'type': 'pixel', 'name': 'Shadow',
+                'image': shadow_img, 'blend_mode': 'mul ', 'opacity': 200, 'lid': lid
+            })
+            lid += 1
+            print(f'[Step 5] Shadow added ✓')
+
+        # STEP 4: Subject as masked layer above
+        if subject_rgba:
+            specs.append({
+                'type': 'pixel', 'name': 'Subject',
+                'image': subject_rgba, 'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+            })
+            lid += 1
+            print(f'[Step 4] Subject layer added ✓')
+
+        # STEP 6: Color adjustments — placed inside an "Adjustments" group
+        # PSD layer order: close-marker first (bottom), children, open-marker last (top)
+        if use_groups:
+            # Close marker (bottom of group)
+            specs.append({'type': 'group_close', 'name': '', 'lid': lid})
+            lid += 1
+
+        # Adjustment layers (bottom to top within group)
+        specs.append({
+            'type': 'adjustment', 'name': 'Brightness/Contrast 1',
+            'adj_block': make_brit_block(brightness, contrast),
+            'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        specs.append({
+            'type': 'adjustment', 'name': 'Levels 1',
+            'adj_block': make_levl_block(shadows=lvl_shadows, midtones=lvl_midtones,
+                                         highlights=lvl_highlights),
+            'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        specs.append({
+            'type': 'adjustment', 'name': 'Curves 1',
+            'adj_block': make_curv_block([(0, 0), (87, 93), (255, 255)]),
+            'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        if hue != 0 or saturation != 0 or lightness != 0:
+            specs.append({
+                'type': 'adjustment', 'name': 'Hue/Saturation 1',
+                'adj_block': make_hue2_block(hue=hue, saturation=saturation, lightness=lightness),
+                'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+            })
+            lid += 1
+
+        if cb_midtone_cr or cb_midtone_mg or cb_midtone_yb:
+            specs.append({
+                'type': 'adjustment', 'name': 'Color Balance 1',
+                'adj_block': make_blnc_block(midtone_cr=cb_midtone_cr,
+                                             midtone_mg=cb_midtone_mg,
+                                             midtone_yb=cb_midtone_yb),
+                'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+            })
+            lid += 1
+
+        specs.append({
+            'type': 'adjustment', 'name': 'Gradient Map 1',
+            'adj_block': make_grdm_block(),
+            'blend_mode': 'norm', 'opacity': 255, 'lid': lid
+        })
+        lid += 1
+
+        if use_groups:
+            # Open marker (top of group)
+            specs.append({'type': 'group_open', 'name': 'Adjustments', 'lid': lid})
+            lid += 1
+
+        print(f'[Pipeline] Building PSD with {len(specs)} layers...')
+
+        # Build PSD
+        psd = create_psd(specs, W, H, clean_background, ppi=300)
+
+        buf = io.BytesIO(psd)
+        buf.seek(0)
+        return send_file(buf, mimetype='application/octet-stream',
+                         as_attachment=True, download_name='layerai-pro.psd')
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 # === Test/Debug Endpoints ===
 
