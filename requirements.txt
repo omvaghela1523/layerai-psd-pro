@@ -4,3 +4,4 @@ requests==2.32.3
 Pillow==10.4.0
 numpy==1.26.4
 gunicorn==22.0.0
+rembg[cpu]==2.0.75
