@@ -24,27 +24,11 @@ CORS(app)
 
 # ── Environment variables ────────────────────────────────────────────────────
 # ONLY 1 API KEY NEEDED: OPENAI_API_KEY
-# Remove.bg replaced with rembg (FREE, local, unlimited)
-# Railway replaced with OpenAI (direct call from Render)
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY")
 
-# Optional — if you have these, they'll be used as fallback/extra
+# Optional — if you have these, they'll be used as fallback
 REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
 RAILWAY_API_URL   = os.environ.get("RAILWAY_API_URL", "")
-
-# rembg lazy import (downloads model on first use ~170MB)
-_rembg_session = None
-def get_rembg():
-    global _rembg_session
-    if _rembg_session is None:
-        try:
-            from rembg import new_session
-            _rembg_session = new_session("u2net")
-            print("[rembg] Model loaded ✓")
-        except ImportError:
-            print("[rembg] Not installed — pip install rembg[cpu]")
-            _rembg_session = False
-    return _rembg_session if _rembg_session else None
 
 # ── Helper: struct pack shortcut ─────────────────────────────────────────────
 def pk(fmt, *a):
@@ -715,28 +699,13 @@ def detect_text(image_bytes):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SUBJECT EXTRACTION — rembg (FREE) or Remove.bg (paid fallback)
+# SUBJECT EXTRACTION — Remove.bg or OpenAI-based fallback
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def extract_subject(raw_bytes, W, H):
-    """Extract subject from image. Tries rembg first (FREE), then Remove.bg."""
-    
-    # Method 1: rembg (FREE, local, unlimited)
-    session = get_rembg()
-    if session:
-        try:
-            from rembg import remove
-            input_img = Image.open(io.BytesIO(raw_bytes))
-            output = remove(input_img, session=session)
-            subject = output.convert('RGBA')
-            if subject.size != (W, H):
-                subject = subject.resize((W, H), Image.LANCZOS)
-            print('[Subject] rembg extraction ✓')
-            return subject
-        except Exception as e:
-            print(f'[Subject] rembg failed: {e}')
+    """Extract subject from image. Uses Remove.bg if available."""
 
-    # Method 2: Remove.bg (paid, API)
+    # Method 1: Remove.bg (if credits available)
     if REMOVE_BG_API_KEY:
         try:
             rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
@@ -746,12 +715,62 @@ def extract_subject(raw_bytes, W, H):
                 subject = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
                 if subject.size != (W, H):
                     subject = subject.resize((W, H), Image.LANCZOS)
-                print('[Subject] Remove.bg extraction ✓')
+                print('[Subject] Remove.bg ✓')
                 return subject
             else:
-                print(f'[Subject] Remove.bg: {rsp.status_code} {rsp.text[:100]}')
+                print(f'[Subject] Remove.bg: {rsp.status_code}')
         except Exception as e:
             print(f'[Subject] Remove.bg: {e}')
+
+    # Method 2: OpenAI — generate transparent version of subject
+    if OPENAI_API_KEY:
+        try:
+            b64 = base64.b64encode(raw_bytes).decode('utf-8')
+
+            # Use OpenAI image edit with transparent background
+            img_buf = io.BytesIO()
+            orig = Image.open(io.BytesIO(raw_bytes)).convert('RGBA')
+
+            # Create mask: everything is transparent (to be regenerated)
+            # We'll ask OpenAI to recreate just the subject with transparent bg
+            mask = Image.new('RGBA', orig.size, (0, 0, 0, 0))  # fully transparent = edit everything
+            mask_buf = io.BytesIO()
+            mask.save(mask_buf, format='PNG')
+            mask_buf.seek(0)
+
+            orig_buf = io.BytesIO()
+            orig.save(orig_buf, format='PNG')
+            orig_buf.seek(0)
+
+            resp = http_requests.post(
+                "https://api.openai.com/v1/images/edits",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files={
+                    "image": ("image.png", orig_buf, "image/png"),
+                },
+                data={
+                    "model": "gpt-image-1",
+                    "prompt": "Extract ONLY the main person/subject from this image. Remove the entire background completely. Output ONLY the subject with a fully transparent background. Keep the subject exactly as it appears - same position, same size, same colors, same details. The background must be 100% transparent.",
+                    "n": "1",
+                    "size": "auto",
+                    "background": "transparent",
+                },
+                timeout=120
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                b64_result = data.get('data', [{}])[0].get('b64_json')
+                if b64_result:
+                    subject = Image.open(io.BytesIO(base64.b64decode(b64_result))).convert('RGBA')
+                    if subject.size != (W, H):
+                        subject = subject.resize((W, H), Image.LANCZOS)
+                    print('[Subject] OpenAI extraction ✓')
+                    return subject
+            else:
+                print(f'[Subject] OpenAI: {resp.status_code} {resp.text[:200]}')
+        except Exception as e:
+            print(f'[Subject] OpenAI: {e}')
 
     print('[Subject] No extraction method available')
     return None
@@ -944,7 +963,7 @@ def gen_psd_pro():
 
         specs, lid = [], 1
 
-        # STEP 1: Extract subject (rembg FREE or Remove.bg fallback)
+        # STEP 1: Extract subject (OpenAI or Remove.bg)
         subject_rgba = extract_subject(raw, W, H)
 
         # STEP 2: Inpaint background
@@ -1064,7 +1083,7 @@ def gen_psd_fast():
             except Exception as e:
                 print(f'[TextDetect] {e}')
 
-        # Subject extraction (rembg FREE or Remove.bg fallback)
+        # Subject extraction (OpenAI or Remove.bg)
         subject_rgba = extract_subject(raw, W, H)
         if subject_rgba:
             # Subject layer
