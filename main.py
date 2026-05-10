@@ -6,7 +6,7 @@ Production-ready PSD generator matching reference PSD structure.
 Deploy: Render (Python Flask)
 Env vars needed:
   - REMOVE_BG_API_KEY    → Subject extraction (remove.bg)
-  - STABILITY_API_KEY    → Background inpainting (stability.ai)
+  - OPENAI_API_KEY       → Background inpainting (OpenAI gpt-image-1)
   - RAILWAY_API_URL      → Claude AI analysis (your Railway server URL)
 
 NO Google Vision needed — text detection done by Claude on Railway.
@@ -24,7 +24,7 @@ CORS(app)
 
 # ── Environment variables ────────────────────────────────────────────────────
 REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
-STABILITY_API_KEY = os.environ.get("STABILITY_API_KEY")
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY")
 RAILWAY_API_URL   = os.environ.get("RAILWAY_API_URL", "")
 
 # ── Helper: struct pack shortcut ─────────────────────────────────────────────
@@ -558,43 +558,97 @@ def make_soft_shadow(subject_rgba, offset_x=10, offset_y=30, blur_radius=25, opa
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# INPAINTING — Stability AI (clean background generation)
+# INPAINTING — OpenAI gpt-image-1.5 (clean background generation)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def inpaint_background(original_bytes, subject_mask, prompt="natural background, photorealistic"):
-    if not STABILITY_API_KEY:
-        print('[Inpaint] STABILITY_API_KEY not set')
+    """
+    Use OpenAI gpt-image-1.5 to fill the subject area with realistic background.
+    
+    subject_mask: PIL Image (L mode) — white=subject area to fill, black=keep
+    The mask needs transparent areas = regions to edit (OpenAI format)
+    """
+    if not OPENAI_API_KEY:
+        print('[Inpaint] OPENAI_API_KEY not set')
         return None
     try:
-        orig = Image.open(io.BytesIO(original_bytes)).convert('RGB')
+        orig = Image.open(io.BytesIO(original_bytes)).convert('RGBA')
         W, H = orig.size
+
+        # Resize for API (max 4MB per image for best speed)
         scale = 1.0
-        if W * H > 1024 * 1024:
-            scale = (1024 * 1024 / (W * H)) ** 0.5
-            orig = orig.resize((int(W*scale), int(H*scale)), Image.LANCZOS)
-            subject_mask = subject_mask.resize((int(W*scale), int(H*scale)), Image.LANCZOS)
+        if W * H > 1536 * 1536:
+            scale = (1536 * 1536 / (W * H)) ** 0.5
+            new_W, new_H = int(W * scale), int(H * scale)
+            orig = orig.resize((new_W, new_H), Image.LANCZOS)
+            subject_mask = subject_mask.resize((new_W, new_H), Image.LANCZOS)
 
-        img_buf = io.BytesIO(); orig.save(img_buf, format='PNG'); img_buf.seek(0)
-        mask_dilated = subject_mask.filter(ImageFilter.MaxFilter(15))
-        mask_buf = io.BytesIO(); mask_dilated.convert('L').save(mask_buf, format='PNG'); mask_buf.seek(0)
+        # OpenAI mask format: RGBA PNG where transparent = area to edit
+        # Our mask: white=subject (area to fill), black=background (keep)
+        # Convert: make subject area transparent, background opaque
+        mask_arr = np.array(subject_mask)
+        mask_rgba = np.zeros((mask_arr.shape[0], mask_arr.shape[1], 4), dtype=np.uint8)
+        mask_rgba[:, :, 0] = 0
+        mask_rgba[:, :, 1] = 0
+        mask_rgba[:, :, 2] = 0
+        mask_rgba[:, :, 3] = 255 - mask_arr  # transparent where subject is (to fill)
+        mask_img = Image.fromarray(mask_rgba, 'RGBA')
 
+        # Dilate mask slightly for better edge blending
+        mask_dilated_l = subject_mask.filter(ImageFilter.MaxFilter(11))
+        mask_arr2 = np.array(mask_dilated_l)
+        mask_rgba2 = np.zeros_like(mask_rgba)
+        mask_rgba2[:, :, 3] = 255 - mask_arr2
+        mask_img = Image.fromarray(mask_rgba2, 'RGBA')
+
+        # Save to buffers
+        img_buf = io.BytesIO()
+        orig.save(img_buf, format='PNG')
+        img_buf.seek(0)
+
+        mask_buf = io.BytesIO()
+        mask_img.save(mask_buf, format='PNG')
+        mask_buf.seek(0)
+
+        print(f'[Inpaint] Calling OpenAI gpt-image-1.5...')
         resp = http_requests.post(
-            "https://api.stability.ai/v2beta/stable-image/edit/inpaint",
-            headers={"authorization": f"Bearer {STABILITY_API_KEY}", "accept": "image/*"},
-            files={"image": ("image.png", img_buf, "image/png"), "mask": ("mask.png", mask_buf, "image/png")},
-            data={"prompt": prompt, "output_format": "png", "mode": "mask"},
-            timeout=60
+            "https://api.openai.com/v1/images/edits",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={
+                "image": ("image.png", img_buf, "image/png"),
+                "mask": ("mask.png", mask_buf, "image/png"),
+            },
+            data={
+                "model": "gpt-image-1",
+                "prompt": f"Fill the transparent area with the surrounding background. {prompt}. Keep the existing background exactly as is. Only fill the missing area to match seamlessly.",
+                "n": "1",
+                "size": "auto",
+            },
+            timeout=120
         )
+
         if resp.status_code != 200:
-            print(f'[Inpaint] Error {resp.status_code}: {resp.text[:200]}')
+            print(f'[Inpaint] Error {resp.status_code}: {resp.text[:300]}')
             return None
-        result = Image.open(io.BytesIO(resp.content)).convert('RGB')
+
+        data = resp.json()
+        b64 = data.get('data', [{}])[0].get('b64_json')
+        if not b64:
+            print('[Inpaint] No image in response')
+            return None
+
+        result = Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGB')
+
+        # Resize back if scaled
         if scale != 1.0:
             result = result.resize((W, H), Image.LANCZOS)
-        print(f'[Inpaint] Success')
+
+        print(f'[Inpaint] Success: {result.size}')
         return result
+
     except Exception as e:
-        print(f'[Inpaint] {e}')
+        print(f'[Inpaint] Error: {e}')
+        traceback.print_exc()
         return None
 
 
@@ -761,7 +815,7 @@ def health():
         "status": "ok", "service": "LayerAI PSD Pro", "version": "5.0.0",
         "apis": {
             "remove_bg": "on" if REMOVE_BG_API_KEY else "OFF",
-            "stability_ai": "on" if STABILITY_API_KEY else "OFF",
+            "openai_inpaint": "on" if OPENAI_API_KEY else "OFF",
             "railway_claude": "on" if RAILWAY_API_URL else "OFF"
         }
     })
@@ -772,7 +826,7 @@ def gen_psd_pro():
     """
     FULL 7-STEP PIPELINE:
     1. Extract subject (Remove.bg)
-    2. Inpaint clean background (Stability AI)
+    2. Inpaint clean background (OpenAI)
     3. Background as bottom layer
     4. Subject as masked layer
     5. Soft shadow under subject
@@ -825,7 +879,7 @@ def gen_psd_pro():
 
         # STEP 2: Inpaint background
         bg_image = orig.convert('RGB')
-        if subject_rgba and STABILITY_API_KEY:
+        if subject_rgba and OPENAI_API_KEY:
             mask = subject_rgba.split()[-1]
             inpainted = inpaint_background(raw, mask, inpaint_prompt)
             if inpainted:
@@ -886,6 +940,114 @@ def gen_psd_pro():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/generate-psd-fast', methods=['POST'])
+@app.route('/generate-psd-dynamic', methods=['POST'])
+def gen_psd_fast():
+    """
+    FAST PIPELINE (~30 sec):
+    Skips OpenAI inpainting. Uses original image as background.
+    Subject extraction + Shadow + Text + Adjustments.
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image uploaded"}), 400
+
+        brightness = int(request.form.get('brightness', 0))
+        contrast = int(request.form.get('contrast', 0))
+        hue = int(request.form.get('hue', 0))
+        saturation = int(request.form.get('saturation', 0))
+        lightness = int(request.form.get('lightness', 0))
+        lvl_shadows = int(request.form.get('lvl_shadows', 0))
+        lvl_midtones = int(request.form.get('lvl_midtones', 100))
+        lvl_highlights = int(request.form.get('lvl_highlights', 255))
+        cb_midtone_cr = int(request.form.get('cb_midtone_cr', 0))
+        cb_midtone_mg = int(request.form.get('cb_midtone_mg', 0))
+        cb_midtone_yb = int(request.form.get('cb_midtone_yb', 0))
+
+        raw = request.files['image'].read()
+        orig = Image.open(io.BytesIO(raw)).convert('RGBA')
+        W, H = orig.size
+        print(f'[Fast] {W}x{H}')
+
+        specs, lid = [], 1
+
+        # Background (original image)
+        specs.append({'type': 'pixel', 'name': 'Backgroundd', 'image': orig.copy(),
+                      'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+
+        # Text detection (via Claude on Railway)
+        if RAILWAY_API_URL:
+            try:
+                detect_bytes = raw
+                if len(raw) > 2 * 1024 * 1024:
+                    small = Image.open(io.BytesIO(raw))
+                    small.thumbnail((800, 800), Image.LANCZOS)
+                    buf = io.BytesIO(); small.save(buf, format='JPEG', quality=80); detect_bytes = buf.getvalue()
+                texts = detect_text(detect_bytes)
+                for t in texts[:5]:
+                    tx, ty = int(t.get('x', 50)), int(t.get('y', 50))
+                    tw = max(int(t.get('w', 100)), 20)
+                    th = max(int(t.get('h', 30)), 15)
+                    specs.append({'type': 'text', 'name': t['text'][:20], 'text': t['text'],
+                                  'x': tx, 'y': ty, 'w': tw, 'h': th, 'font_size': max(12.0, th * 0.8),
+                                  'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+            except Exception as e:
+                print(f'[TextDetect] {e}')
+
+        # Subject extraction (Remove.bg)
+        if REMOVE_BG_API_KEY:
+            try:
+                rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
+                    files={'image_file': ('i.jpg', raw, 'image/jpeg')},
+                    data={'size': 'auto'}, headers={'X-Api-Key': REMOVE_BG_API_KEY}, timeout=30)
+                if rsp.status_code == 200:
+                    subject_rgba = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
+                    if subject_rgba.size != (W, H):
+                        subject_rgba = subject_rgba.resize((W, H), Image.LANCZOS)
+
+                    # Subject layer
+                    specs.append({'type': 'pixel', 'name': 'Subject', 'image': subject_rgba,
+                                  'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+
+                    # Shadow
+                    shadow = make_soft_shadow(subject_rgba)
+                    specs.append({'type': 'pixel', 'name': 'Shadow', 'image': shadow,
+                                  'blend_mode': 'mul ', 'opacity': 200, 'lid': lid}); lid += 1
+                    print('[Fast] Subject + Shadow done')
+                else:
+                    print(f'[Fast] Remove.bg error: {rsp.status_code}')
+            except Exception as e:
+                print(f'[Fast] Remove.bg: {e}')
+
+        # Adjustments
+        specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1',
+                      'adj_block': make_brit_block(brightness, contrast),
+                      'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+        specs.append({'type': 'adjustment', 'name': 'Levels 1',
+                      'adj_block': make_levl_block(lvl_shadows, lvl_midtones, lvl_highlights),
+                      'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+        specs.append({'type': 'adjustment', 'name': 'Curves 1',
+                      'adj_block': make_curv_block([(0,0),(87,93),(255,255)]),
+                      'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+
+        if hue or saturation or lightness:
+            specs.append({'type': 'adjustment', 'name': 'Hue/Saturation 1',
+                          'adj_block': make_hue2_block(hue, saturation, lightness),
+                          'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+
+        if cb_midtone_cr or cb_midtone_mg or cb_midtone_yb:
+            specs.append({'type': 'adjustment', 'name': 'Color Balance 1',
+                          'adj_block': make_blnc_block(midtone_cr=cb_midtone_cr, midtone_mg=cb_midtone_mg, midtone_yb=cb_midtone_yb),
+                          'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
+
+        psd = create_psd(specs, W, H, orig.convert('RGB'), ppi=300)
+        buf = io.BytesIO(psd); buf.seek(0)
+        return send_file(buf, mimetype='application/octet-stream', as_attachment=True, download_name='layerai-fast.psd')
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/generate-psd', methods=['POST'])
 def gen_psd_simple():
     """Simple PSD — no inpainting, just layers."""
@@ -926,7 +1088,7 @@ def gen_psd_simple():
 def debug_env():
     return jsonify({
         "REMOVE_BG_API_KEY": "SET" if REMOVE_BG_API_KEY else "NOT SET",
-        "STABILITY_API_KEY": "SET" if STABILITY_API_KEY else "NOT SET",
+        "OPENAI_API_KEY": "SET" if OPENAI_API_KEY else "NOT SET",
         "RAILWAY_API_URL": RAILWAY_API_URL or "NOT SET"
     })
 
@@ -935,6 +1097,6 @@ if __name__ == '__main__':
     print("=" * 50)
     print("  LayerAI PSD Pro — V5.0.0 FINAL")
     print("  No Google Vision — Claude text detection only")
-    print("  APIs: Remove.bg + Stability AI + Claude")
+    print("  APIs: Remove.bg + OpenAI + Claude")
     print("=" * 50)
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
