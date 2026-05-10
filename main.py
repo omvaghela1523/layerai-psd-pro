@@ -23,9 +23,28 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Environment variables ────────────────────────────────────────────────────
-REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
+# ONLY 1 API KEY NEEDED: OPENAI_API_KEY
+# Remove.bg replaced with rembg (FREE, local, unlimited)
+# Railway replaced with OpenAI (direct call from Render)
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY")
+
+# Optional — if you have these, they'll be used as fallback/extra
+REMOVE_BG_API_KEY = os.environ.get("REMOVE_BG_API_KEY")
 RAILWAY_API_URL   = os.environ.get("RAILWAY_API_URL", "")
+
+# rembg lazy import (downloads model on first use ~170MB)
+_rembg_session = None
+def get_rembg():
+    global _rembg_session
+    if _rembg_session is None:
+        try:
+            from rembg import new_session
+            _rembg_session = new_session("u2net")
+            print("[rembg] Model loaded ✓")
+        except ImportError:
+            print("[rembg] Not installed — pip install rembg[cpu]")
+            _rembg_session = False
+    return _rembg_session if _rembg_session else None
 
 # ── Helper: struct pack shortcut ─────────────────────────────────────────────
 def pk(fmt, *a):
@@ -653,26 +672,89 @@ def inpaint_background(original_bytes, subject_mask, prompt="natural background,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TEXT DETECTION (via Claude on Railway — no Google Vision)
+# TEXT DETECTION (via OpenAI Vision — no Railway needed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def detect_text(image_bytes):
-    if not RAILWAY_API_URL or not image_bytes:
+    """Detect text in image using OpenAI Vision API directly."""
+    if not OPENAI_API_KEY or not image_bytes:
         return []
+
+    # Try Railway first if available
+    if RAILWAY_API_URL:
+        try:
+            resp = http_requests.post(f'{RAILWAY_API_URL}/detect-text',
+                files={'image': ('img.jpg', image_bytes, 'image/jpeg')}, timeout=15)
+            if resp.status_code == 200:
+                return resp.json().get('texts', [])
+        except:
+            pass
+
+    # Fallback: OpenAI Vision directly
     try:
-        resp = http_requests.post(
-            f'{RAILWAY_API_URL}/detect-text',
-            files={'image': ('image.jpg', image_bytes, 'image/jpeg')},
-            timeout=30
-        )
+        b64 = base64.b64encode(image_bytes).decode('utf-8')
+        resp = http_requests.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}},
+                    {"type": "text", "text": 'Find ALL text in this image. Return ONLY JSON: {"texts":[{"text":"exact text","x":100,"y":200,"w":300,"h":40}]} If no text: {"texts":[]}'}
+                ]}]
+            }, timeout=20)
         if resp.status_code == 200:
-            data = resp.json()
-            texts = data.get('texts', [])
-            print(f'[TextDetect] Found {len(texts)} texts')
+            content = resp.json()['choices'][0]['message']['content']
+            parsed = json.loads(content.replace('```json','').replace('```','').strip())
+            texts = parsed.get('texts', [])
+            print(f'[TextDetect] OpenAI found {len(texts)} texts')
             return texts
     except Exception as e:
         print(f'[TextDetect] {e}')
     return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SUBJECT EXTRACTION — rembg (FREE) or Remove.bg (paid fallback)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def extract_subject(raw_bytes, W, H):
+    """Extract subject from image. Tries rembg first (FREE), then Remove.bg."""
+    
+    # Method 1: rembg (FREE, local, unlimited)
+    session = get_rembg()
+    if session:
+        try:
+            from rembg import remove
+            input_img = Image.open(io.BytesIO(raw_bytes))
+            output = remove(input_img, session=session)
+            subject = output.convert('RGBA')
+            if subject.size != (W, H):
+                subject = subject.resize((W, H), Image.LANCZOS)
+            print('[Subject] rembg extraction ✓')
+            return subject
+        except Exception as e:
+            print(f'[Subject] rembg failed: {e}')
+
+    # Method 2: Remove.bg (paid, API)
+    if REMOVE_BG_API_KEY:
+        try:
+            rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
+                files={'image_file': ('i.jpg', raw_bytes, 'image/jpeg')},
+                data={'size': 'auto'}, headers={'X-Api-Key': REMOVE_BG_API_KEY}, timeout=30)
+            if rsp.status_code == 200:
+                subject = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
+                if subject.size != (W, H):
+                    subject = subject.resize((W, H), Image.LANCZOS)
+                print('[Subject] Remove.bg extraction ✓')
+                return subject
+            else:
+                print(f'[Subject] Remove.bg: {rsp.status_code} {rsp.text[:100]}')
+        except Exception as e:
+            print(f'[Subject] Remove.bg: {e}')
+
+    print('[Subject] No extraction method available')
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -862,20 +944,8 @@ def gen_psd_pro():
 
         specs, lid = [], 1
 
-        # STEP 1: Extract subject
-        subject_rgba = None
-        if REMOVE_BG_API_KEY:
-            try:
-                rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
-                    files={'image_file': ('i.jpg', raw, 'image/jpeg')},
-                    data={'size': 'auto'}, headers={'X-Api-Key': REMOVE_BG_API_KEY}, timeout=30)
-                if rsp.status_code == 200:
-                    subject_rgba = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
-                    if subject_rgba.size != (W, H):
-                        subject_rgba = subject_rgba.resize((W, H), Image.LANCZOS)
-                    print('[Step 1] Subject extracted')
-            except Exception as e:
-                print(f'[Step 1] {e}')
+        # STEP 1: Extract subject (rembg FREE or Remove.bg fallback)
+        subject_rgba = extract_subject(raw, W, H)
 
         # STEP 2: Inpaint background
         bg_image = orig.convert('RGB')
@@ -994,30 +1064,18 @@ def gen_psd_fast():
             except Exception as e:
                 print(f'[TextDetect] {e}')
 
-        # Subject extraction (Remove.bg)
-        if REMOVE_BG_API_KEY:
-            try:
-                rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
-                    files={'image_file': ('i.jpg', raw, 'image/jpeg')},
-                    data={'size': 'auto'}, headers={'X-Api-Key': REMOVE_BG_API_KEY}, timeout=30)
-                if rsp.status_code == 200:
-                    subject_rgba = Image.open(io.BytesIO(rsp.content)).convert('RGBA')
-                    if subject_rgba.size != (W, H):
-                        subject_rgba = subject_rgba.resize((W, H), Image.LANCZOS)
+        # Subject extraction (rembg FREE or Remove.bg fallback)
+        subject_rgba = extract_subject(raw, W, H)
+        if subject_rgba:
+            # Subject layer
+            specs.append({'type': 'pixel', 'name': 'Subject', 'image': subject_rgba,
+                          'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
 
-                    # Subject layer
-                    specs.append({'type': 'pixel', 'name': 'Subject', 'image': subject_rgba,
-                                  'blend_mode': 'norm', 'opacity': 255, 'lid': lid}); lid += 1
-
-                    # Shadow
-                    shadow = make_soft_shadow(subject_rgba)
-                    specs.append({'type': 'pixel', 'name': 'Shadow', 'image': shadow,
-                                  'blend_mode': 'mul ', 'opacity': 200, 'lid': lid}); lid += 1
-                    print('[Fast] Subject + Shadow done')
-                else:
-                    print(f'[Fast] Remove.bg error: {rsp.status_code}')
-            except Exception as e:
-                print(f'[Fast] Remove.bg: {e}')
+            # Shadow
+            shadow = make_soft_shadow(subject_rgba)
+            specs.append({'type': 'pixel', 'name': 'Shadow', 'image': shadow,
+                          'blend_mode': 'mul ', 'opacity': 200, 'lid': lid}); lid += 1
+            print('[Fast] Subject + Shadow done')
 
         # Adjustments
         specs.append({'type': 'adjustment', 'name': 'Brightness/Contrast 1',
