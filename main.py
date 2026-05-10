@@ -1093,6 +1093,78 @@ def debug_env():
     })
 
 
+@app.route('/test-apis', methods=['POST'])
+def test_apis():
+    """Test each API individually — upload an image and see what works/fails."""
+    results = {"step1_removebg": "SKIPPED", "step2_openai": "SKIPPED", "step3_railway": "SKIPPED"}
+
+    if 'image' not in request.files:
+        return jsonify({"error": "Upload image with key 'image'"}), 400
+
+    raw = request.files['image'].read()
+    results["image_size"] = len(raw)
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        results["image_dimensions"] = f"{img.size[0]}x{img.size[1]}"
+    except:
+        results["image_error"] = "Cannot open image"
+        return jsonify(results), 400
+
+    # Test 1: Remove.bg
+    if REMOVE_BG_API_KEY:
+        try:
+            rsp = http_requests.post('https://api.remove.bg/v1.0/removebg',
+                files={'image_file': ('i.jpg', raw, 'image/jpeg')},
+                data={'size': 'preview'}, headers={'X-Api-Key': REMOVE_BG_API_KEY}, timeout=30)
+            if rsp.status_code == 200:
+                results["step1_removebg"] = f"OK — got {len(rsp.content)} bytes"
+            else:
+                results["step1_removebg"] = f"FAIL — {rsp.status_code}: {rsp.text[:200]}"
+        except Exception as e:
+            results["step1_removebg"] = f"ERROR — {str(e)}"
+    else:
+        results["step1_removebg"] = "NO KEY"
+
+    # Test 2: Railway (Claude text detection)
+    if RAILWAY_API_URL:
+        try:
+            # First test health
+            h = http_requests.get(f'{RAILWAY_API_URL}/health', timeout=10)
+            results["step3_railway_health"] = f"{h.status_code}: {h.text[:100]}"
+
+            # Then test detect-text
+            small = Image.open(io.BytesIO(raw))
+            small.thumbnail((512, 512), Image.LANCZOS)
+            buf = io.BytesIO(); small.save(buf, format='JPEG', quality=70); buf.seek(0)
+            rsp = http_requests.post(f'{RAILWAY_API_URL}/detect-text',
+                files={'image': ('img.jpg', buf.getvalue(), 'image/jpeg')}, timeout=30)
+            if rsp.status_code == 200:
+                results["step3_railway"] = f"OK — {rsp.text[:200]}"
+            else:
+                results["step3_railway"] = f"FAIL — {rsp.status_code}: {rsp.text[:200]}"
+        except Exception as e:
+            results["step3_railway"] = f"ERROR — {str(e)}"
+    else:
+        results["step3_railway"] = "NO URL"
+
+    # Test 3: OpenAI (just check key validity, don't actually inpaint)
+    if OPENAI_API_KEY:
+        try:
+            rsp = http_requests.get("https://api.openai.com/v1/models",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=10)
+            if rsp.status_code == 200:
+                results["step2_openai"] = "OK — key valid"
+            else:
+                results["step2_openai"] = f"FAIL — {rsp.status_code}: {rsp.text[:200]}"
+        except Exception as e:
+            results["step2_openai"] = f"ERROR — {str(e)}"
+    else:
+        results["step2_openai"] = "NO KEY"
+
+    return jsonify(results)
+
+
 if __name__ == '__main__':
     print("=" * 50)
     print("  LayerAI PSD Pro — V5.0.0 FINAL")
